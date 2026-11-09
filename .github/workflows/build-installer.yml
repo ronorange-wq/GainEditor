@@ -1,0 +1,48 @@
+name: Build Mac Installer
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14   # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Audio Unit
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          cmake --build build --config Release -j 4
+
+      - name: Make installer (.pkg)
+        run: |
+          AU=$(find build -name "Gain Editor.component" -type d | head -1)
+          echo "Component: $AU"
+          pkgbuild --component "$AU" \
+                   --install-location "/Library/Audio/Plug-Ins/Components" \
+                   --identifier com.gaineditor.plugin --version 1.0.0 \
+                   "Gain Editor Installer.pkg"
+
+      - name: Validate
+        run: |
+          sudo installer -pkg "Gain Editor Installer.pkg" -target /
+          killall -9 AudioComponentRegistrar || true
+          auval -v aufx Gedt Gned | tail -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Gain-Editor-Installer
+          path: Gain Editor Installer.pkg
+
+      - name: Publish download link (Releases)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest -y --cleanup-tag || true
+          gh release create latest "Gain Editor Installer.pkg" \
+            --title "Gain Editor - latest build" \
+            --notes "Download Gain Editor Installer.pkg, then right-click > Open to install (Audio Unit for Ableton, Apple Silicon + Intel)."

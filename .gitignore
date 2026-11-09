@@ -1,0 +1,5 @@
+build/
+build-*/
+JUCE/
+*.pkg
+.DS_Store
