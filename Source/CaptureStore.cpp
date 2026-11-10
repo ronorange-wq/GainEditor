@@ -56,6 +56,7 @@ void CaptureStore::clear()
     writtenEnd = 0;
     dirtyStart = 0;
     dirtyEnd = std::numeric_limits<int32_t>::max();   // force a full UI refresh
+    ++generation;
 }
 
 float* CaptureStore::chunkFor (int64_t pos) const noexcept
@@ -94,6 +95,7 @@ bool CaptureStore::write (int64_t pos, const float* data, int n) noexcept
         atomicMax (writtenEnd, pos + n);
         atomicMin (dirtyStart, pos);
         atomicMax (dirtyEnd, pos + n);
+        generation.fetch_add (1, std::memory_order_relaxed);
     }
     return ok;
 }
@@ -176,20 +178,64 @@ bool CaptureStore::loadFromFile (const juce::File& f, int64_t timelineStart)
 {
     juce::WavAudioFormat wav;
     std::unique_ptr<juce::AudioFormatReader> reader (wav.createReaderFor (f.createInputStream().release(), true));
-    if (reader == nullptr)
+    return reader != nullptr && loadFromReader (*reader, timelineStart);
+}
+
+bool CaptureStore::loadFromReader (juce::AudioFormatReader& reader, int64_t timelineStart)
+{
+    const auto len = (int64_t) reader.lengthInSamples;
+    if (len <= 0)
         return false;
 
-    const auto len = (int64_t) reader->lengthInSamples;
-    setSampleRate (reader->sampleRate);
+    setSampleRate (reader.sampleRate);
     ensureAllocated (timelineStart, timelineStart + len);
 
     constexpr int block = 65536;
-    juce::AudioBuffer<float> buf (1, block);
+    juce::AudioBuffer<float> buf ((int) juce::jmax (1u, reader.numChannels), block);
     for (int64_t p = 0; p < len; p += block)
     {
         const auto n = (int) juce::jmin ((int64_t) block, len - p);
-        reader->read (&buf, 0, n, p, true, false);
+        buf.clear();
+        reader.read (&buf, 0, n, p, true, false);
         write (timelineStart + p, buf.getReadPointer (0), n);
     }
     return true;
+}
+
+bool CaptureStore::encodeToFlac (juce::MemoryBlock& dest) const
+{
+    dest.reset();
+    if (! hasData())
+        return false;
+
+    juce::FlacAudioFormat flac;
+    auto* out = new juce::MemoryOutputStream (dest, false);
+    std::unique_ptr<juce::AudioFormatWriter> writer (flac.createWriterFor (out, getSampleRate(), 1, 24, {}, 5));
+    if (writer == nullptr)
+    {
+        delete out;
+        return false;
+    }
+
+    const auto start = getWrittenStart();
+    const auto end = getWrittenEnd();
+    constexpr int block = 65536;
+    juce::AudioBuffer<float> buf (1, block);
+
+    for (auto p = start; p < end; p += block)
+    {
+        const auto n = (int) juce::jmin ((int64_t) block, end - p);
+        read (p, buf.getWritePointer (0), n);
+        if (! writer->writeFromAudioSampleBuffer (buf, 0, n))
+            return false;
+    }
+    writer.reset(); // flushes into dest
+    return dest.getSize() > 0;
+}
+
+bool CaptureStore::decodeFromFlac (const juce::MemoryBlock& src, int64_t timelineStart)
+{
+    juce::FlacAudioFormat flac;
+    std::unique_ptr<juce::AudioFormatReader> reader (flac.createReaderFor (new juce::MemoryInputStream (src, true), true));
+    return reader != nullptr && loadFromReader (*reader, timelineStart);
 }

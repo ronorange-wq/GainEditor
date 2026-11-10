@@ -47,6 +47,14 @@ public:
     // ---- persistence (message / background thread) ----
     bool saveToFile (const juce::File& f) const;
     bool loadFromFile (const juce::File& f, int64_t timelineStart);
+    bool loadFromReader (juce::AudioFormatReader& reader, int64_t timelineStart);
+
+    /** Encodes the captured audio (FLAC, 24-bit) so it can be stored inside the project. */
+    bool encodeToFlac (juce::MemoryBlock& dest) const;
+    bool decodeFromFlac (const juce::MemoryBlock& src, int64_t timelineStart);
+
+    /** Changes every time audio is written or cleared (used to know when to re-encode). */
+    uint64_t getGeneration() const noexcept { return generation.load(); }
 
 private:
     float* chunkFor (int64_t pos) const noexcept;
@@ -57,6 +65,7 @@ private:
     std::atomic<int64_t> dirtyStart { std::numeric_limits<int64_t>::max() };
     std::atomic<int64_t> dirtyEnd { 0 };
     std::atomic<double> sampleRate { 48000.0 };
+    std::atomic<uint64_t> generation { 0 };
 
     static void atomicMin (std::atomic<int64_t>& a, int64_t v) noexcept;
     static void atomicMax (std::atomic<int64_t>& a, int64_t v) noexcept;

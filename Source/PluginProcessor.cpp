@@ -29,7 +29,6 @@ GainEditorProcessor::GainEditorProcessor()
 GainEditorProcessor::~GainEditorProcessor()
 {
     stopTimer();
-    saver.removeAllJobs (false, 10000);
     liveMap.store (nullptr);
 }
 
@@ -214,8 +213,6 @@ void GainEditorProcessor::setCapturing (bool shouldCapture)
     else
     {
         capturing = false;
-        captureDirty = true;
-        saveCaptureAsync();
         redetectBlobs (edits.blobResolution);
     }
     sendChangeMessage();
@@ -225,7 +222,6 @@ void GainEditorProcessor::clearCapture()
 {
     capturing = false;
     stopAudition();
-    saver.removeAllJobs (false, 10000);
     suspendProcessing (true);
     capture.clear();
     capture.setSampleRate (currentSampleRate);
@@ -234,7 +230,6 @@ void GainEditorProcessor::clearCapture()
     auto s = edits;
     s.blobs.clear();
     setEdits (s, true, "Clear Recording");
-    captureId = {};
     sendChangeMessage();
 }
 
@@ -279,59 +274,57 @@ void GainEditorProcessor::timerCallback()
                        retiredMaps.end());
 }
 
-juce::File GainEditorProcessor::captureFile() const
+juce::File GainEditorProcessor::legacyCaptureFile (const juce::String& id) const
 {
+    // Version 1.0 kept recordings as separate files. Still read them so old projects open.
     auto dir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory);
    #if JUCE_MAC
     dir = dir.getChildFile ("Application Support");
    #endif
-    return dir.getChildFile ("GainEditor").getChildFile ("Captures").getChildFile (captureId + ".wav");
-}
-
-void GainEditorProcessor::saveCaptureAsync()
-{
-    if (! capture.hasData())
-        return;
-
-    if (captureId.isEmpty())
-        captureId = juce::Uuid().toString();
-
-    const auto file = captureFile();
-    captureDirty = false;
-    saver.addJob ([this, file] { capture.saveToFile (file); });
+    return dir.getChildFile ("GainEditor").getChildFile ("Captures").getChildFile (id + ".wav");
 }
 
 //==============================================================================
 void GainEditorProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    if (captureDirty)
-    {
-        // Make sure the recording is on disk before the host stores the project.
-        if (captureId.isEmpty())
-            captureId = juce::Uuid().toString();
-        capture.saveToFile (captureFile());
-        captureDirty = false;
-    }
-
     juce::ValueTree root ("GAINEDITOR");
-    root.setProperty ("version", 1, nullptr);
-    root.setProperty ("captureId", captureId, nullptr);
-    root.setProperty ("captureStart", (juce::int64) (capture.hasData() ? capture.getWrittenStart() : 0), nullptr);
-    root.setProperty ("captureRate", capture.getSampleRate(), nullptr);
+    root.setProperty ("version", 2, nullptr);
     root.appendChild (edits.toValueTree(), nullptr);
     root.appendChild (uiState.createCopy(), nullptr);
 
-    if (auto xml = root.createXml())
-        copyXmlToBinary (*xml, destData);
+    if (capture.hasData())
+    {
+        const juce::ScopedLock sl (encodeLock);
+        const auto gen = capture.getGeneration();
+        if (gen != encodedGeneration || encodedAudio.isEmpty())
+        {
+            capture.encodeToFlac (encodedAudio);
+            encodedGeneration = gen;
+        }
+
+        root.setProperty ("captureStart", (juce::int64) capture.getWrittenStart(), nullptr);
+        root.setProperty ("captureRate", capture.getSampleRate(), nullptr);
+        root.setProperty ("audio", juce::var (encodedAudio), nullptr);
+    }
+
+    juce::MemoryOutputStream out (destData, false);
+    out.writeInt (0x47456432); // "GEd2"
+    root.writeToStream (out);
 }
 
 void GainEditorProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
-    auto xml = getXmlFromBinary (data, sizeInBytes);
-    if (xml == nullptr)
-        return;
+    juce::ValueTree root;
 
-    auto root = juce::ValueTree::fromXml (*xml);
+    if (sizeInBytes > 4 && juce::ByteOrder::littleEndianInt (data) == 0x47456432)
+    {
+        root = juce::ValueTree::readFromData (static_cast<const char*> (data) + 4, (size_t) sizeInBytes - 4);
+    }
+    else if (auto xml = getXmlFromBinary (data, sizeInBytes))   // version 1 projects
+    {
+        root = juce::ValueTree::fromXml (*xml);
+    }
+
     if (! root.hasType ("GAINEDITOR"))
         return;
 
@@ -339,21 +332,35 @@ void GainEditorProcessor::setStateInformation (const void* data, int sizeInBytes
     if (auto ui = root.getChildWithName ("UI"); ui.isValid())
         uiState = ui.createCopy();
 
-    captureId = root.getProperty ("captureId").toString();
     const auto start = (int64_t) (juce::int64) root.getProperty ("captureStart", 0);
 
-    if (captureId.isNotEmpty())
+    suspendProcessing (true);
+    capturing = false;
+    auditioning = false;
+    capture.clear();
+
+    bool loaded = false;
+    if (auto* mb = root.getProperty ("audio").getBinaryData())
     {
-        auto f = captureFile();
-        if (f.existsAsFile())
+        loaded = capture.decodeFromFlac (*mb, start);
+        if (loaded)
         {
-            saver.removeAllJobs (false, 10000);
-            suspendProcessing (true);
-            capture.clear();
-            capture.loadFromFile (f, start);
-            suspendProcessing (false);
+            const juce::ScopedLock sl (encodeLock);
+            encodedAudio = *mb;
+            encodedGeneration = capture.getGeneration();
         }
     }
+
+    if (! loaded)
+    {
+        const auto id = root.getProperty ("captureId").toString();
+        if (id.isNotEmpty() && legacyCaptureFile (id).existsAsFile())
+            loaded = capture.loadFromFile (legacyCaptureFile (id), start);
+    }
+
+    if (! capture.hasData())
+        capture.setSampleRate (currentSampleRate);
+    suspendProcessing (false);
 
     undoManager.clearUndoHistory();
     publishGainMap();

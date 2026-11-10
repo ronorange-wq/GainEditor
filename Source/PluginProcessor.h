@@ -72,8 +72,7 @@ public:
 private:
     void timerCallback() override;
     void publishGainMap();
-    void saveCaptureAsync();
-    juce::File captureFile() const;
+    juce::File legacyCaptureFile (const juce::String& id) const;
 
     CaptureStore capture;
     EditState edits, dragStartState;
@@ -89,9 +88,10 @@ private:
     std::vector<float> monoScratch;
     double currentSampleRate = 48000.0;
 
-    juce::String captureId;
-    bool captureDirty = false;
-    juce::ThreadPool saver { 1 };
+    // The recording is stored inside the Ableton project (FLAC), encoded once per change.
+    juce::MemoryBlock encodedAudio;
+    uint64_t encodedGeneration = std::numeric_limits<uint64_t>::max();
+    juce::CriticalSection encodeLock;
 
     friend struct EditAction;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GainEditorProcessor)
