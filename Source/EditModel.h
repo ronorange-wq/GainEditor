@@ -23,7 +23,9 @@ struct EnvPoint
 */
 struct SpotEdit
 {
-    enum Kind : int { blob = 0, peak = 1, peakAuto = 2 };   // peakAuto: made by the Reduction control
+    enum Kind : int { blob = 0, peak = 1, peakAuto = 2, sib = 3, sibAuto = 4 };   // *Auto: made by a Reduction control
+    static bool isSibilance (int k) noexcept { return k == sib || k == sibAuto; }
+    static bool isPeak (int k) noexcept { return k == peak || k == peakAuto; }
     int64_t start = 0, end = 0;
     float db = 0.0f;
     int kind = blob;
@@ -37,6 +39,10 @@ struct EditState
     std::vector<RangeEdit> ranges;
     std::vector<EnvPoint> envelope;    // kept sorted by pos
     std::vector<SpotEdit> spots;       // kept sorted by start
+
+    // Sibilance edits: lower the whole sound (volume) or only the highs above sibFreq (filter)
+    bool sibFilter = false;
+    float sibFreq = 5000.0f;
 
     bool operator== (const EditState& o) const;
     bool operator!= (const EditState& o) const { return ! (*this == o); }
@@ -55,6 +61,7 @@ struct GainMap
     int64_t origin = 0;                // timeline sample of gains[0]
     std::vector<float> gains;          // linear gain per hop
     float before = 1.0f, after = 1.0f; // gain outside the covered region
+    float hpFreq = 5000.0f;            // for the sibilance map: where "the highs" start
 
     float gainAt (int64_t pos) const noexcept;
 };
@@ -70,6 +77,12 @@ namespace EditOps
     float spotDbAt (const EditState& s, int64_t pos, double sampleRate);
 
     std::shared_ptr<GainMap> buildGainMap (const EditState& s, double sampleRate);
+    /** Gain for the highs only (sibilance in Filter mode). Empty when there is nothing to do. */
+    std::shared_ptr<GainMap> buildSibMap (const EditState& s, double sampleRate);
+    /** dB of the sibilance edits alone at pos (used for drawing in Filter mode). */
+    float sibOnlyDbAt (const EditState& s, int64_t pos, double sampleRate);
+    /** What the waveform shows: the full change, including Filter-mode sibilance as if it were volume. */
+    float displayDbAt (const EditState& s, int64_t pos, double sampleRate);
 
     enum ResetWhat { resetEverything = 0, resetRanges, resetEnvelope, resetSpots };
 

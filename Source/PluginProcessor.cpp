@@ -50,6 +50,7 @@ GainEditorProcessor::~GainEditorProcessor()
 {
     stopTimer();
     liveMap.store (nullptr);
+    liveSibMap.store (nullptr);
 }
 
 bool GainEditorProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -64,6 +65,8 @@ void GainEditorProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate;
     monoScratch.assign ((size_t) juce::jmax (1, samplesPerBlock) * 2, 0.0f);
+    sibScratch.assign ((size_t) juce::jmax (1, samplesPerBlock) * 2, 1.0f);
+    for (auto& h : highs) h.reset();
 
     if (! capture.hasData())
         capture.setSampleRate (sampleRate);
@@ -85,6 +88,13 @@ void GainEditorProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         return; // host broke its promise about block size; pass audio through untouched
 
     const auto* map = liveMap.load (std::memory_order_acquire);
+    const auto* sibMap = liveSibMap.load (std::memory_order_acquire);
+    const bool sibActive = sibMap != nullptr && ! sibMap->gains.empty();
+    if (sibActive)
+        for (auto& h : highs) h.setup (currentSampleRate, sibMap->hpFreq);
+
+    // y = (x - (1 - gHighs) * highpass(x)) * gain : with gHighs = 1 the sound is untouched
+    auto lowerHighs = [] (HighPass4& hp, float x, float gHighs) { const auto h = hp.process (x); return x - (1.0f - gHighs) * h; };
 
     // ---- Audition: play the captured take (with edits) from inside the plugin ----
     if (auditioning.load())
@@ -95,7 +105,11 @@ void GainEditorProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
         capture.read (pos, monoScratch.data(), n);
         for (int i = 0; i < n; ++i)
-            monoScratch[(size_t) i] *= map != nullptr ? map->gainAt (pos + i) : 1.0f;
+        {
+            auto v = monoScratch[(size_t) i];
+            if (sibActive) v = lowerHighs (highs[2], v, sibMap->gainAt (pos + i));
+            monoScratch[(size_t) i] = v * (map != nullptr ? map->gainAt (pos + i) : 1.0f);
+        }
         std::fill (monoScratch.begin() + n, monoScratch.begin() + numSamples, 0.0f);
 
         for (int ch = 0; ch < numCh; ++ch)
@@ -159,13 +173,21 @@ void GainEditorProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         return;
 
     for (int i = 0; i < numSamples; ++i)
+    {
         monoScratch[(size_t) i] = map->gainAt (timelinePos + i);
+        sibScratch[(size_t) i] = sibActive ? sibMap->gainAt (timelinePos + i) : 1.0f;
+    }
 
     for (int ch = 0; ch < numCh; ++ch)
     {
         auto* d = buffer.getWritePointer (ch);
+        auto& hp = highs[juce::jmin (ch, 1)];
         for (int i = 0; i < numSamples; ++i)
-            d[i] *= monoScratch[(size_t) i];
+        {
+            auto v = d[i];
+            if (sibActive) v = lowerHighs (hp, v, sibScratch[(size_t) i]);   // the filter keeps running so it never clicks in
+            d[i] = v * monoScratch[(size_t) i];
+        }
     }
 }
 
@@ -183,6 +205,12 @@ void GainEditorProcessor::publishGainMap()
         retiredMaps.push_back ({ std::move (ownedMap), juce::Time::getMillisecondCounter() });
     }
     ownedMap.reset (raw);
+
+    auto* rawSib = new GainMap (*EditOps::buildSibMap (edits, capture.getSampleRate()));
+    liveSibMap.exchange (rawSib, std::memory_order_acq_rel);
+    if (ownedSibMap != nullptr)
+        retiredMaps.push_back ({ std::move (ownedSibMap), juce::Time::getMillisecondCounter() });
+    ownedSibMap.reset (rawSib);
 }
 
 void GainEditorProcessor::setEdits (const EditState& newState, bool undoable, const juce::String& actionName)

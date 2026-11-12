@@ -14,7 +14,7 @@ bool EditState::operator== (const EditState& o) const
     auto sameSpots = spots.size() == o.spots.size()
         && std::equal (spots.begin(), spots.end(), o.spots.begin(), [] (const SpotEdit& x, const SpotEdit& y)
                { return x.start == y.start && x.end == y.end && juce::exactlyEqual (x.db, y.db) && x.kind == y.kind; });
-    return sameRanges && sameEnv && sameSpots;
+    return sameRanges && sameEnv && sameSpots && sibFilter == o.sibFilter && juce::exactlyEqual (sibFreq, o.sibFreq);
 }
 
 namespace
@@ -40,6 +40,8 @@ juce::ValueTree EditState::toValueTree() const
 {
     juce::ValueTree v ("EDITS");
     v.setProperty ("format", 2, nullptr);
+    v.setProperty ("sibFilter", sibFilter, nullptr);
+    v.setProperty ("sibFreq", sibFreq, nullptr);
     v.setProperty ("ranges", encodeList (ranges, [] (juce::MemoryOutputStream& o, const RangeEdit& r)
                    { o.writeInt64 (r.start); o.writeInt64 (r.end); o.writeFloat (r.db); }), nullptr);
     v.setProperty ("envelope", encodeList (envelope, [] (juce::MemoryOutputStream& o, const EnvPoint& p)
@@ -54,6 +56,8 @@ EditState EditState::fromValueTree (const juce::ValueTree& v)
     EditState s;
     if (! v.hasType ("EDITS"))
         return s;
+    s.sibFilter = (bool) v.getProperty ("sibFilter", false);
+    s.sibFreq = (float) v.getProperty ("sibFreq", 5000.0f);
 
     {
         auto mb = decode (v.getProperty ("ranges").toString());
@@ -178,10 +182,28 @@ namespace EditOps
         for (auto& b : s.spots)
         {
             if (b.start > pos) break;          // sorted by start
+            if (s.sibFilter && SpotEdit::isSibilance (b.kind)) continue;   // goes to the highs only
             if (pos < b.end)
                 db += b.db * edgeWeight (pos, b.start, b.end, sr);
         }
         return db;
+    }
+
+    float sibOnlyDbAt (const EditState& s, int64_t pos, double sr)
+    {
+        float db = 0.0f;
+        for (auto& b : s.spots)
+        {
+            if (b.start > pos) break;
+            if (SpotEdit::isSibilance (b.kind) && pos < b.end)
+                db += b.db * edgeWeight (pos, b.start, b.end, sr);
+        }
+        return db;
+    }
+
+    float displayDbAt (const EditState& s, int64_t pos, double sr)
+    {
+        return totalDbAt (s, pos, sr) + (s.sibFilter ? sibOnlyDbAt (s, pos, sr) : 0.0f);
     }
 
     float totalDbAt (const EditState& s, int64_t pos, double sr)
@@ -197,7 +219,7 @@ namespace EditOps
         auto extend = [&] (int64_t a, int64_t b) { lo = juce::jmin (lo, a); hi = juce::jmax (hi, b); };
 
         for (auto& r : s.ranges)   if (std::abs (r.db) > 0.0f) extend (r.start, r.end);
-        for (auto& b : s.spots)    if (std::abs (b.db) > 0.0f) extend (b.start, b.end);
+        for (auto& b : s.spots)    if (std::abs (b.db) > 0.0f && ! (s.sibFilter && SpotEdit::isSibilance (b.kind))) extend (b.start, b.end);
         for (auto& p : s.envelope) extend (p.pos, p.pos + 1);
 
         map->before = juce::Decibels::decibelsToGain (envelopeDbAt (s, std::numeric_limits<int64_t>::min() / 2));
@@ -228,8 +250,42 @@ namespace EditOps
                 db[i] += value * edgeWeight (lo + (int64_t) i * GainMap::hop, a, b, sr);
         };
         for (auto& r : s.ranges) addRegion (r.start, r.end, r.db);
-        for (auto& b : s.spots)  addRegion (b.start, b.end, b.db);
+        for (auto& b : s.spots)
+            if (! (s.sibFilter && SpotEdit::isSibilance (b.kind)))
+                addRegion (b.start, b.end, b.db);
 
+        map->gains.resize (n);
+        for (size_t i = 0; i < n; ++i)
+            map->gains[i] = juce::Decibels::decibelsToGain (db[i], -120.0f);
+        return map;
+    }
+
+    std::shared_ptr<GainMap> buildSibMap (const EditState& s, double sr)
+    {
+        auto map = std::make_shared<GainMap>();
+        map->hpFreq = s.sibFreq;
+        if (! s.sibFilter)
+            return map;
+
+        int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
+        for (auto& b : s.spots)
+            if (SpotEdit::isSibilance (b.kind) && std::abs (b.db) > 0.0f) { lo = juce::jmin (lo, b.start); hi = juce::jmax (hi, b.end); }
+        if (hi <= lo)
+            return map;
+
+        lo = juce::jmax ((int64_t) 0, lo - GainMap::hop);
+        hi += GainMap::hop * 2;
+        map->origin = lo;
+        const auto n = (size_t) ((hi - lo) / GainMap::hop + 1);
+        std::vector<float> db (n, 0.0f);
+        for (auto& b : s.spots)
+        {
+            if (! SpotEdit::isSibilance (b.kind)) continue;
+            const auto i0 = (size_t) juce::jmax ((int64_t) 0, (b.start - lo) / GainMap::hop);
+            const auto i1 = (size_t) juce::jmin ((int64_t) n - 1, (b.end - lo) / GainMap::hop + 1);
+            for (auto i = i0; i <= i1; ++i)
+                db[i] += b.db * edgeWeight (lo + (int64_t) i * GainMap::hop, b.start, b.end, sr);
+        }
         map->gains.resize (n);
         for (size_t i = 0; i < n; ++i)
             map->gains[i] = juce::Decibels::decibelsToGain (db[i], -120.0f);
@@ -329,7 +385,9 @@ namespace EditOps
 
     EditState resetAll (const EditState& in)
     {
-        juce::ignoreUnused (in);
-        return EditState{};
+        EditState s;
+        s.sibFilter = in.sibFilter;
+        s.sibFreq = in.sibFreq;
+        return s;
     }
 }

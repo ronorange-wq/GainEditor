@@ -43,6 +43,20 @@ namespace Analysis
     */
     void applyAutoReduction (EditState& edits, const CaptureStore& audio, float thresholdGain, float reductionDb);
 
+    /** A detected "S" (sibilance). */
+    struct Sibilant
+    {
+        int64_t start = 0, end = 0;   // region (already padded for soft edges)
+        int64_t at = 0;               // loudest sample
+        float level = 0.0f;           // loudest |sample| in the original audio
+    };
+
+    /** Finds sibilance (S, SH, TS...) by looking for short parts where the highs above freq dominate. */
+    std::vector<Sibilant> detectSibilance (const CaptureStore& audio, int64_t start, int64_t end, float sensitivity, float freq);
+
+    /** The Reduction control for sibilance: every detected S not edited by hand gets an automatic spot. */
+    void applyAutoSibReduction (EditState& edits, const CaptureStore& audio, float sensitivity, float reductionDb);
+
     /** Highest |sample| after the edits in [a, b). */
     float levelAfterEdits (const CaptureStore& audio, const EditState& edits, int64_t a, int64_t b);
 

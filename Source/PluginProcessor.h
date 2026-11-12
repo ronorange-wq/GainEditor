@@ -2,6 +2,7 @@
 #include <JuceHeader.h>
 #include "CaptureStore.h"
 #include "EditModel.h"
+#include "HighPass.h"
 
 class GainEditorProcessor : public juce::AudioProcessor,
                             public juce::ChangeBroadcaster,
@@ -71,6 +72,12 @@ public:
     float getReductionDb() const;
     void setReductionDb (float db);
 
+    // ---- Sibilance controls (sensitivity 0..1, reduction dB) ----
+    float getSibSensitivity() const { return (float) uiState.getProperty ("sibSensitivity", 0.65f); }
+    void setSibSensitivity (float v) { uiState.setProperty ("sibSensitivity", juce::jlimit (0.0f, 1.0f, v), nullptr); sendChangeMessage(); }
+    float getSibReductionDb() const { return (float) uiState.getProperty ("sibReductionDb", 0.0f); }
+    void setSibReductionDb (float v) { uiState.setProperty ("sibReductionDb", juce::jlimit (-24.0f, 0.0f, v), nullptr); }
+
     // ---- Ableton transport through a virtual MIDI port called "Gain Editor" ----
     bool isAbletonSync() const;
     void setAbletonSync (bool on);
@@ -94,9 +101,11 @@ private:
     bool dragging = false;
     juce::UndoManager undoManager { 0, 200 };
 
-    std::atomic<GainMap*> liveMap { nullptr };
+    std::atomic<GainMap*> liveMap { nullptr }, liveSibMap { nullptr };
     std::vector<std::pair<std::unique_ptr<GainMap>, juce::uint32>> retiredMaps;
-    std::unique_ptr<GainMap> ownedMap;
+    std::unique_ptr<GainMap> ownedMap, ownedSibMap;
+    HighPass4 highs[3];          // per channel (2) + audition (1)
+    std::vector<float> sibScratch;
 
     std::atomic<bool> capturing { false }, hostPlaying { false }, auditioning { false };
     std::atomic<int64_t> playPos { 0 }, auditionPos { 0 }, auditionEnd { 0 };

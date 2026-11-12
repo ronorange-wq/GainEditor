@@ -162,6 +162,17 @@ void ToolButton::drawIcon (juce::Graphics& g, Icon icon, juce::Rectangle<float> 
                 g.drawDashedLine (juce::Line<float> (x, y + h * 0.38f, x + w, y + h * 0.38f), dashes, 2, 1.4f);
             }
             break;
+        case Icon::sibilance:
+            p.startNewSubPath (x, y + h * 0.6f);
+            p.lineTo (x + w * 0.1f, y + h * 0.6f);
+            for (int i = 0; i < 7; ++i)
+                p.lineTo (x + w * (0.14f + i * 0.06f), y + h * (i % 2 == 0 ? 0.35f : 0.85f));
+            p.lineTo (x + w * 0.6f, y + h * 0.6f);
+            p.lineTo (x + w, y + h * 0.6f);
+            g.strokePath (p, juce::PathStrokeType (1.4f));
+            g.setFont (juce::FontOptions (h * 0.55f, juce::Font::bold));
+            g.drawText ("S", juce::Rectangle<float> (x + w * 0.62f, y - h * 0.08f, w * 0.38f, h * 0.5f), juce::Justification::centred);
+            break;
         case Icon::link:
         {
             const auto r1 = juce::Rectangle<float> (x + w * 0.05f, y + h * 0.32f, w * 0.52f, h * 0.36f);
@@ -251,8 +262,9 @@ void StepperBox::paint (juce::Graphics& g)
     g.drawRoundedRectangle (r, 7.0f, 1.0f);
 
     const auto minus = juce::String (juce::CharPointer_UTF8 ("\xe2\x88\x92"));
-    auto txt = (value < 0.0f ? minus : juce::String()) + juce::String (std::abs (value), 1) + " dB";
-    g.setColour (Theme::text);
+    const auto shown = value * scale;
+    auto txt = (shown < -0.0001f ? minus : juce::String()) + juce::String (std::abs (shown), decimals) + suffix;
+    g.setColour (Theme::text.withAlpha (isEnabled() ? 1.0f : 0.35f));
     g.setFont (juce::FontOptions (24.0f));
     g.drawText (txt, r.withTrimmedLeft (18.0f).withTrimmedRight (36.0f), juce::Justification::centredLeft);
 
@@ -312,6 +324,53 @@ AnalysisPanel::AnalysisPanel()
     reductionSlider.setTooltip ("Lower every peak over the threshold by this much. Peaks you dragged by hand keep their own value.");
     addAndMakeVisible (reductionSlider);
     threshold.setTooltip ("Peaks over this level get a diamond in the Peak tool");
+
+    auto styleSlider = [] (juce::Slider& sl, double lo, double hi, double step)
+    {
+        sl.setSliderStyle (juce::Slider::LinearHorizontal);
+        sl.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        sl.setRange (lo, hi, step);
+        sl.setColour (juce::Slider::trackColourId, Theme::wave);
+        sl.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff3a414c));
+        sl.setColour (juce::Slider::thumbColourId, juce::Colours::white);
+    };
+    styleSlider (sensitivitySlider, 0.0, 1.0, 0.01);
+    styleSlider (sibReductionSlider, -24.0, 0.0, 0.1);
+    sibReductionSlider.setColour (juce::Slider::trackColourId, juce::Colour (0xff3a414c));
+    sibReductionSlider.setColour (juce::Slider::backgroundColourId, Theme::wave);
+    sensitivity.setTooltip ("How easily a sound counts as an S. More = finds softer S sounds too");
+    sibReduction.setTooltip ("Lower every S by this much. An S you dragged by hand keeps its own value");
+    frequency.setTooltip ("Filter mode: only the highs above this frequency are lowered");
+    volumeMode.setTooltip ("Lower the whole sound of each S");
+    filterMode.setTooltip ("Lower only the highs of each S (like a de-esser); the rest of the voice is untouched");
+    for (auto* b : { &volumeMode, &filterMode })
+    {
+        b->setClickingTogglesState (false);
+        b->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff20252d));
+        b->setColour (juce::TextButton::buttonOnColourId, Theme::active);
+        b->setColour (juce::TextButton::textColourOffId, Theme::text);
+        b->setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+        b->setColour (juce::ComboBox::outlineColourId, Theme::buttonLine);
+        b->setWantsKeyboardFocus (false);
+    }
+    volumeMode.setConnectedEdges (juce::Button::ConnectedOnRight);
+    filterMode.setConnectedEdges (juce::Button::ConnectedOnLeft);
+    for (juce::Component* c : { (juce::Component*) &sensitivity, (juce::Component*) &sensitivitySlider, (juce::Component*) &sibReduction,
+                                (juce::Component*) &sibReductionSlider, (juce::Component*) &volumeMode, (juce::Component*) &filterMode, (juce::Component*) &frequency })
+        addChildComponent (c);
+}
+
+void AnalysisPanel::setSibilanceMode (bool sib)
+{
+    if (sib == sibMode && getNumChildComponents() > 0 && threshold.isVisible() != sib) return;
+    sibMode = sib;
+    for (juce::Component* c : { (juce::Component*) &threshold, (juce::Component*) &reduction, (juce::Component*) &reductionSlider })
+        c->setVisible (! sib);
+    for (juce::Component* c : { (juce::Component*) &sensitivity, (juce::Component*) &sensitivitySlider, (juce::Component*) &sibReduction,
+                                (juce::Component*) &sibReductionSlider, (juce::Component*) &volumeMode, (juce::Component*) &filterMode, (juce::Component*) &frequency })
+        c->setVisible (sib);
+    resized();
+    repaint();
 }
 
 void AnalysisPanel::setAnalysis (const Analysis::LoudnessReport& r, const juce::String& s, const juce::String& e, double secs, bool valid)
@@ -322,6 +381,55 @@ void AnalysisPanel::setAnalysis (const Analysis::LoudnessReport& r, const juce::
 
 void AnalysisPanel::paint (juce::Graphics& g)
 {
+    if (sibMode)
+    {
+        g.fillAll (Theme::bar);
+        g.setColour (juce::Colours::black);
+        g.fillRect (0, 0, 1, getHeight());
+        auto r = getLocalBounds().reduced (22, 18);
+        auto title = [&] (const juce::String& t) { g.setColour (Theme::text); g.setFont (juce::FontOptions (20.0f)); g.drawText (t, r.removeFromTop (30), juce::Justification::centredLeft); };
+        auto line = [&] { g.setColour (Theme::buttonLine); g.fillRect (r.removeFromTop (1)); r.removeFromTop (14); };
+        title ("Sensitivity");
+        r.removeFromTop (4 + 44 + 4 + 22);
+        g.setColour (Theme::textDim);
+        g.setFont (juce::FontOptions (12.5f));
+        g.drawText (juce::String (juce::CharPointer_UTF8 ("Less S  \xe2\x86\x90    \xe2\x86\x92  More S")), r.removeFromTop (20), juce::Justification::centredLeft);
+        line();
+        title ("Reduction");
+        r.removeFromTop (4 + 44 + 4 + 22 + 10);
+        title ("Mode");
+        r.removeFromTop (4 + 32 + 8 + 40 + 12);
+        line();
+
+        title ("Sibilance");
+        const auto minus = juce::String (juce::CharPointer_UTF8 ("\xe2\x88\x92"));
+        auto row = [&] (const juce::String& name, const juce::String& value, bool dot = false)
+        {
+            auto ln = r.removeFromTop (26);
+            if (dot)
+            {
+                g.setColour (juce::Colour (0xfff4f6f8));
+                g.fillRoundedRectangle (ln.removeFromLeft (14).withSizeKeepingCentre (13, 13).toFloat(), 3.0f);
+                ln.removeFromLeft (10);
+            }
+            g.setColour (Theme::text.withAlpha (0.8f));
+            g.setFont (juce::FontOptions (15.0f));
+            g.drawText (name, ln, juce::Justification::centredLeft);
+            g.setColour (Theme::text);
+            g.setFont (juce::FontOptions (17.0f));
+            g.drawText (value, ln, juce::Justification::centredRight);
+        };
+        auto db = [&] (float v, const juce::String& unit) { return v <= -149.0f ? juce::String ("-") : (v < 0 ? minus : juce::String()) + juce::String (std::abs (v), 1) + unit; };
+        row ("Detected", juce::String (sibInfo.detected) + " S", true);
+        row ("In selection", juce::String (sibInfo.inSelection));
+        row ("Loudest S", db (sibInfo.loudestDb, " dBFS"));
+        r.removeFromTop (4); line();
+        row ("Selected S", sibInfo.hasSelected ? sibInfo.selStart : juce::String ("-"));
+        row ("Length", sibInfo.hasSelected ? juce::String (sibInfo.selLength, 3) + " s" : juce::String ("-"));
+        row ("Gain", sibInfo.hasSelected ? db (sibInfo.selDb, " dB") : juce::String ("-"));
+        return;
+    }
+
     g.fillAll (Theme::bar);
     g.setColour (juce::Colours::black);
     g.fillRect (0, 0, 1, getHeight());
@@ -399,13 +507,33 @@ void AnalysisPanel::paint (juce::Graphics& g)
 void AnalysisPanel::resized()
 {
     auto r = getLocalBounds().reduced (22, 18);
+    if (! sibMode)
+    {
+        r.removeFromTop (34);
+        threshold.setBounds (r.removeFromTop (52));
+        r.removeFromTop (25);
+        r.removeFromTop (34);
+        reduction.setBounds (r.removeFromTop (52));
+        r.removeFromTop (10);
+        reductionSlider.setBounds (r.removeFromTop (28));
+        return;
+    }
     r.removeFromTop (34);
-    threshold.setBounds (r.removeFromTop (52));
-    r.removeFromTop (25);
+    sensitivity.setBounds (r.removeFromTop (44));
+    r.removeFromTop (4);
+    sensitivitySlider.setBounds (r.removeFromTop (22));
+    r.removeFromTop (20 + 15);
     r.removeFromTop (34);
-    reduction.setBounds (r.removeFromTop (52));
+    sibReduction.setBounds (r.removeFromTop (44));
+    r.removeFromTop (4);
+    sibReductionSlider.setBounds (r.removeFromTop (22));
     r.removeFromTop (10);
-    reductionSlider.setBounds (r.removeFromTop (28));
+    r.removeFromTop (34);
+    auto modes = r.removeFromTop (32);
+    volumeMode.setBounds (modes.removeFromLeft (modes.getWidth() / 2));
+    filterMode.setBounds (modes);
+    r.removeFromTop (8);
+    frequency.setBounds (r.removeFromTop (40));
 }
 
 //==============================================================================
@@ -425,8 +553,8 @@ GainEditorEditor::GainEditorEditor (GainEditorProcessor& p)
 {
     setWantsKeyboardFocus (true);
 
-    for (auto* b : { &playBtn, &stopBtn, &recordBtn, &syncBtn, &rangeBtn, &envBtn, &blobBtn, &peakBtn,
-                     &undoBtn, &redoBtn, &resetBtn, &loudBtn })
+    for (auto* b : { &playBtn, &stopBtn, &recordBtn, &syncBtn, &rangeBtn, &envBtn, &blobBtn, &peakBtn, &sibBtn,
+                     &undoBtn, &redoBtn, &resetBtn, &loudBtn, &showSibBtn })
     {
         b->setWantsKeyboardFocus (false);
         addAndMakeVisible (b);
@@ -436,6 +564,73 @@ GainEditorEditor::GainEditorEditor (GainEditorProcessor& p)
     envBtn.setShortcutHint ("2");
     blobBtn.setShortcutHint ("3");
     peakBtn.setShortcutHint ("4");
+    sibBtn.setShortcutHint ("5");
+    sibBtn.setTooltip ("Sibilance [5]: every S is shown in white with a diamond; drag it down to lower that S");
+    showSibBtn.setTooltip ("Show the detected S sounds (white) while using the other tools too");
+    sibBtn.onClick = [this] { selectTool (Tool::sibilance); };
+    showSibBtn.onClick = [this]
+    {
+        proc.uiState.setProperty ("showSib", ! (bool) proc.uiState.getProperty ("showSib", false), nullptr);
+        refreshButtons();
+        view.repaint();
+    };
+
+    // ---- Sibilance panel ----
+    panel.sensitivity.setValue (proc.getSibSensitivity(), false);
+    panel.sensitivitySlider.setValue (proc.getSibSensitivity(), juce::dontSendNotification);
+    auto sensitivityChanged = [this] (float v)
+    {
+        proc.setSibSensitivity (v);
+        panel.sensitivity.setValue (v, false);
+        panel.sensitivitySlider.setValue (v, juce::dontSendNotification);
+        if (std::abs (proc.getSibReductionDb()) > 0.01f) applySibReduction();
+        updateSibInfo();
+        view.repaint();
+    };
+    panel.sensitivity.onChange = sensitivityChanged;
+    panel.sensitivitySlider.onValueChange = [this, sensitivityChanged] { sensitivityChanged ((float) panel.sensitivitySlider.getValue()); };
+    panel.sensitivity.onDragStart = [this] { proc.beginDrag(); };
+    panel.sensitivity.onDragEnd = [this] { proc.commitDrag ("Sibilance Sensitivity"); };
+    panel.sensitivitySlider.onDragStart = [this] { proc.beginDrag(); };
+    panel.sensitivitySlider.onDragEnd = [this] { proc.commitDrag ("Sibilance Sensitivity"); };
+
+    panel.sibReduction.setValue (proc.getSibReductionDb(), false);
+    panel.sibReductionSlider.setValue (proc.getSibReductionDb(), juce::dontSendNotification);
+    auto sibReductionChanged = [this] (float v)
+    {
+        proc.setSibReductionDb (v);
+        panel.sibReduction.setValue (v, false);
+        panel.sibReductionSlider.setValue (v, juce::dontSendNotification);
+        applySibReduction();
+    };
+    panel.sibReduction.onChange = sibReductionChanged;
+    panel.sibReductionSlider.onValueChange = [this, sibReductionChanged] { sibReductionChanged ((float) panel.sibReductionSlider.getValue()); };
+    panel.sibReduction.onDragStart = [this] { proc.beginDrag(); };
+    panel.sibReduction.onDragEnd = [this] { proc.commitDrag ("Sibilance Reduction"); };
+    panel.sibReductionSlider.onDragStart = [this] { proc.beginDrag(); };
+    panel.sibReductionSlider.onDragEnd = [this] { proc.commitDrag ("Sibilance Reduction"); };
+
+    auto setMode = [this] (bool filter)
+    {
+        auto st = proc.getEdits();
+        if (st.sibFilter == filter) return;
+        st.sibFilter = filter;
+        proc.setEdits (st, true, filter ? "Sibilance: Filter" : "Sibilance: Volume");
+        refreshButtons();
+    };
+    panel.volumeMode.onClick = [setMode] { setMode (false); };
+    panel.filterMode.onClick = [setMode] { setMode (true); };
+    panel.frequency.setValue (proc.getEdits().sibFreq, false);
+    panel.frequency.onDragStart = [this] { proc.beginDrag(); };
+    panel.frequency.onDragEnd = [this] { proc.commitDrag ("Sibilance Frequency"); };
+    panel.frequency.onChange = [this] (float v)
+    {
+        auto st = proc.getEdits();
+        st.sibFreq = v;
+        proc.setEdits (st, false);
+        if (std::abs (proc.getSibReductionDb()) > 0.01f) applySibReduction();
+        updateSibInfo();
+    };
 
     playBtn.setTooltip ("Play from the cursor or the selection  [Space]. With DAW on, Ableton plays too.");
     stopBtn.setTooltip ("Stop  [Space]");
@@ -532,7 +727,7 @@ GainEditorEditor::GainEditorEditor (GainEditorProcessor& p)
 
     auto savedTool = (int) proc.uiState.getProperty ("tool", (int) Tool::blob);
     if (savedTool == (int) Tool::select) savedTool = (int) Tool::blob;
-    selectTool ((Tool) juce::jlimit (1, 4, savedTool));
+    selectTool ((Tool) juce::jlimit (1, 5, savedTool));
 
     peaks.update (proc.getCapture(), 0, proc.getCapture().getWrittenEnd());
     startTimerHz (30);
@@ -554,6 +749,45 @@ void GainEditorEditor::applyReduction (bool undoable)
     proc.setEdits (s, undoable, "Peak Reduction");
 }
 
+void GainEditorEditor::applySibReduction()
+{
+    auto st = proc.getEdits();
+    Analysis::applyAutoSibReduction (st, proc.getCapture(), proc.getSibSensitivity(), proc.getSibReductionDb());
+    proc.setEdits (st, false);
+}
+
+void GainEditorEditor::updateSibInfo()
+{
+    if (! panel.isVisible() || view.getTool() != Tool::sibilance)
+        return;
+    AnalysisPanel::SibInfo info;
+    const auto& list = view.getSibilants();
+    info.detected = (int) list.size();
+    info.freq = proc.getEdits().sibFreq;
+    int64_t a = 0, b = 0;
+    const bool target = view.hasSelection() && view.getTargetRegion (a, b);
+    float loud = 0.0f;
+    for (auto& sb : list)
+    {
+        loud = juce::jmax (loud, sb.level);
+        if (target && sb.start < b && sb.end > a) ++info.inSelection;
+    }
+    info.loudestDb = juce::Decibels::gainToDecibels (loud, -150.0f);
+    const auto sel = view.selectedSibilant();
+    if (sel >= 0)
+    {
+        const auto& sb = list[(size_t) sel];
+        const auto sr = proc.getSampleRateForTimeline();
+        info.hasSelected = true;
+        info.selStart = timeText (sb.start, sr);
+        info.selLength = (double) (sb.end - sb.start) / sr;
+        for (auto& sp : proc.getEdits().spots)
+            if (SpotEdit::isSibilance (sp.kind) && sp.start < sb.end && sp.end > sb.start)
+                info.selDb += sp.db;
+    }
+    panel.setSibInfo (info);
+}
+
 void GainEditorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (Theme::bg);
@@ -569,7 +803,7 @@ void GainEditorEditor::paint (juce::Graphics& g)
 
     g.setColour (Theme::buttonLine);
     g.fillRect (syncBtn.getRight() + 18, 18, 1, 30);
-    g.fillRect (peakBtn.getRight() + 12, 18, 1, 30);
+    g.fillRect (sibBtn.getRight() + 12, 18, 1, 30);
 
     // status bar
     auto status = getLocalBounds().removeFromBottom (40);
@@ -600,6 +834,8 @@ void GainEditorEditor::paint (juce::Graphics& g)
     g.setColour (Theme::text);
     g.setFont (juce::FontOptions (16.0f));
     g.drawText ("Option = fine", status.removeFromLeft (140), juce::Justification::centredLeft);
+    g.setColour (Theme::buttonLine);
+    g.fillRect (status.removeFromLeft (20).withSizeKeepingCentre (1, 22));
 
     const auto sr = proc.getSampleRateForTimeline();
     const auto pos = (proc.isHostPlaying() || proc.isAuditioning()) ? proc.getPlayPosition() : view.getCursor();
@@ -625,14 +861,15 @@ void GainEditorEditor::resized()
     placeRight (undoBtn, 24);
 
     // tools: spread evenly in what is left
-    ToolButton* tools[] = { &rangeBtn, &envBtn, &blobBtn, &peakBtn };
+    ToolButton* tools[] = { &rangeBtn, &envBtn, &blobBtn, &peakBtn, &sibBtn };
     int total = 0;
     for (auto* t : tools) total += t->getIdealWidth();
-    const auto gap = juce::jlimit (8, 30, (bar.getWidth() - total) / 4);
+    const auto gap = juce::jlimit (6, 30, (bar.getWidth() - total) / 5);
     for (auto* t : tools) place (*t, gap);
 
     overview.setBounds (r.removeFromTop (88).reduced (0, 6));
-    r.removeFromBottom (40);
+    auto statusArea = r.removeFromBottom (40);
+    showSibBtn.setBounds (statusArea.withX (380).withWidth (showSibBtn.getIdealWidth()).reduced (0, 6));
     if (panel.isVisible())
         panel.setBounds (r.removeFromRight (290));
     view.setBounds (r);
@@ -656,15 +893,17 @@ void GainEditorEditor::setPanelVisible (bool show)
 void GainEditorEditor::selectTool (Tool t)
 {
     view.setTool (t);
+    panel.setSibilanceMode (t == Tool::sibilance);
+    updateSibInfo();
     refreshButtons();
     grabKeyboardFocus();
 }
 
 void GainEditorEditor::cycleTool (int direction)
 {
-    // Range, Envelope, Blob, Peak  (enum values 1..4)
+    // Range, Envelope, Blob, Peak, Sibilance  (enum values 1..5)
     const auto n = (int) view.getTool() - 1;
-    selectTool ((Tool) (1 + (n + direction + 4) % 4));
+    selectTool ((Tool) (1 + (n + direction + 5) % 5));
 }
 
 void GainEditorEditor::showSyncHelp()
@@ -721,6 +960,11 @@ void GainEditorEditor::refreshButtons()
     envBtn.setActive (tool == Tool::envelope);
     blobBtn.setActive (tool == Tool::blob);
     peakBtn.setActive (tool == Tool::peak);
+    sibBtn.setActive (tool == Tool::sibilance);
+    showSibBtn.setActive ((bool) proc.uiState.getProperty ("showSib", false));
+    panel.volumeMode.setToggleState (! proc.getEdits().sibFilter, juce::dontSendNotification);
+    panel.filterMode.setToggleState (proc.getEdits().sibFilter, juce::dontSendNotification);
+    panel.frequency.setEnabled (proc.getEdits().sibFilter);
     recordBtn.setActive (proc.isCapturing());
     syncBtn.setActive (proc.isAbletonSync());
     playBtn.setActive (proc.isAuditioning() || (proc.isAbletonSync() && proc.isHostPlaying()));
@@ -736,6 +980,7 @@ void GainEditorEditor::changeListenerCallback (juce::ChangeBroadcaster*)
 {
     analysisNeedsUpdate = true;
     panel.threshold.setValue (proc.getThresholdDb(), false);
+    panel.frequency.setValue (proc.getEdits().sibFreq, false);
     refreshButtons();
     overview.repaint();
     repaint (0, getHeight() - 40, getWidth(), 40);
@@ -789,7 +1034,10 @@ void GainEditorEditor::timerCallback()
     }
 
     if (panel.isVisible() && analysisNeedsUpdate)
+    {
         updateAnalysis();
+        updateSibInfo();
+    }
 
     recordBtn.setActive (proc.isCapturing());
     playBtn.setActive (proc.isAuditioning() || (proc.isAbletonSync() && proc.isHostPlaying()));
@@ -833,6 +1081,7 @@ bool GainEditorEditor::keyPressed (const juce::KeyPress& key)
         case '2': selectTool (Tool::envelope); return true;
         case '3': selectTool (Tool::blob); return true;
         case '4': selectTool (Tool::peak); return true;
+        case '5': selectTool (Tool::sibilance); return true;
         case 'l': setPanelVisible (! panel.isVisible()); return true;
         case '+': case '=': view.zoomBy (1.6); return true;
         case '-': case '_': view.zoomBy (1.0 / 1.6); return true;

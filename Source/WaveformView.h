@@ -53,7 +53,7 @@ namespace Theme
 }
 
 //==============================================================================
-enum class Tool { select = 0, range, envelope, blob, peak };
+enum class Tool { select = 0, range, envelope, blob, peak, sibilance };
 
 /** "Blob  +3.0 dB  [Reset]" shown in the top-left corner of the waveform (never over the audio you edit). */
 class GainBadge : public juce::Component
@@ -127,6 +127,9 @@ public:
     void tameAllPeaks();
 
     int64_t getCursor() const noexcept { return cursor; }
+    const std::vector<Analysis::Sibilant>& getSibilants() { refreshSibilance(); return sibs; }
+    /** The S under the selection, for the side panel (index into getSibilants, or -1). */
+    int selectedSibilant();
 
     std::function<void()> onStateChanged;   // selection / tool / view changed
     std::function<void()> onShowLoudness;
@@ -200,6 +203,16 @@ private:
         bool over = true;          // still over the threshold
     };
     std::vector<Diamond> diamonds;
+    Tool diamondsTool = Tool::peak;
+
+    // detected sibilance for the whole take, cached
+    std::vector<Analysis::Sibilant> sibs;
+    float sibSens = -1.0f, sibFreqCached = -1.0f;
+    uint64_t sibGeneration = 0;
+    void refreshSibilance();
+    bool showSibilance() const;
+    void paintSibilanceMarks (juce::Graphics&, juce::Rectangle<int>);
+    float sibDbAt (const Analysis::Sibilant& s) const;
     void refreshDiamonds();
     bool diamondsDirty = true;
     int diamondNear (juce::Point<float> p) const;

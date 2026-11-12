@@ -1,4 +1,5 @@
 #include "Analysis.h"
+#include "HighPass.h"
 #include <cmath>
 
 namespace Analysis
@@ -224,12 +225,106 @@ namespace Analysis
         EditOps::sortSpots (edits);
     }
 
+    std::vector<Sibilant> detectSibilance (const CaptureStore& audio, int64_t start, int64_t end, float sensitivity, float freq)
+    {
+        std::vector<Sibilant> out;
+        if (! audio.hasData()) return out;
+        start = juce::jmax (start, audio.getWrittenStart());
+        end = juce::jmin (end, audio.getWrittenEnd());
+        if (end <= start) return out;
+
+        const auto sr = audio.getSampleRate();
+        const auto sens = (double) juce::jlimit (0.0f, 1.0f, sensitivity);
+        const auto ratioNeeded = 0.72 - 0.40 * sens;                   // share of the energy that must be in the highs
+        const auto levelNeeded = juce::Decibels::decibelsToGain (-38.0 - 14.0 * sens);   // the highs must also be audible
+        const int frame = juce::jmax (32, (int) std::round (sr * 0.005));
+        const auto minLen = (int64_t) (sr * 0.02), maxGap = (int64_t) frame * 3;
+        const auto pad = (int64_t) (sr * (EditOps::edgeFadeSeconds + 0.001));
+
+        TrueHighPass4 hp;
+        hp.setup (sr, freq);
+        std::vector<float> buf ((size_t) frame);
+
+        bool open = false;
+        Sibilant cur;
+        int64_t lastHit = 0;
+
+        auto finish = [&]
+        {
+            if (open && cur.end - cur.start >= minLen)
+            {
+                cur.start -= pad; cur.end += pad;
+                out.push_back (cur);
+            }
+            open = false;
+        };
+
+        for (auto p = start - frame * 4; p < end; p += frame)   // a little warm-up for the filter
+        {
+            audio.read (p, buf.data(), frame);
+            double et = 0.0, eh = 0.0;
+            float peak = 0.0f; int64_t peakAt = p;
+            for (int k = 0; k < frame; ++k)
+            {
+                const auto x = buf[(size_t) k];
+                const auto h = hp.process (x);
+                et += (double) x * x;
+                eh += (double) h * h;
+                if (std::abs (x) > peak) { peak = std::abs (x); peakAt = p + k; }
+            }
+            if (p < start) continue;
+
+            const auto hRms = std::sqrt (eh / frame);
+            const bool hit = et > 1e-12 && eh / et >= ratioNeeded && hRms >= levelNeeded;
+            if (hit)
+            {
+                if (open && p - lastHit <= maxGap)
+                {
+                    cur.end = p + frame;
+                    if (peak > cur.level) { cur.level = peak; cur.at = peakAt; }
+                }
+                else
+                {
+                    finish();
+                    cur = { p, p + frame, peakAt, peak };
+                    open = true;
+                }
+                lastHit = p;
+            }
+            else if (open && p - lastHit > maxGap)
+            {
+                finish();
+            }
+        }
+        finish();
+        return out;
+    }
+
+    void applyAutoSibReduction (EditState& edits, const CaptureStore& audio, float sensitivity, float reductionDb)
+    {
+        edits.spots.erase (std::remove_if (edits.spots.begin(), edits.spots.end(),
+                                           [] (const SpotEdit& s) { return s.kind == SpotEdit::sibAuto; }),
+                           edits.spots.end());
+        if (std::abs (reductionDb) < 0.01f || ! audio.hasData())
+            return;
+
+        auto found = detectSibilance (audio, audio.getWrittenStart(), audio.getWrittenEnd(), sensitivity, edits.sibFreq);
+        for (auto& sb : found)
+        {
+            const bool manual = std::any_of (edits.spots.begin(), edits.spots.end(), [&] (const SpotEdit& s)
+                                             { return s.kind == SpotEdit::sib && s.start < sb.end && s.end > sb.start; });
+            if (! manual)
+                edits.spots.push_back ({ sb.start, sb.end, reductionDb, SpotEdit::sibAuto });
+        }
+        EditOps::sortSpots (edits);
+    }
+
     float levelAfterEdits (const CaptureStore& audio, const EditState& edits, int64_t a, int64_t b)
     {
         float m = 0.0f;
         const auto sr = audio.getSampleRate();
         for (auto p = a; p < b; ++p)
-            m = juce::jmax (m, std::abs (audio.get (p)) * juce::Decibels::decibelsToGain (EditOps::totalDbAt (edits, p, sr), -120.0f));
+            m = juce::jmax (m, std::abs (audio.get (p)) * juce::Decibels::decibelsToGain (EditOps::displayDbAt (edits, p, sr), -120.0f));
         return m;
     }
 
@@ -379,6 +474,16 @@ namespace Analysis
 
         const auto sr = audio.getSampleRate();
         auto map = EditOps::buildGainMap (edits, sr);
+        auto sibMap = EditOps::buildSibMap (edits, sr);
+        HighPass4 hp;
+        hp.setup (sr, edits.sibFreq);
+        // the processed sample, exactly as the plugin plays it
+        auto process = [&] (float x, int64_t pos)
+        {
+            const auto h = hp.process (x);
+            const auto gs = sibMap->gainAt (pos);
+            return (x - (1.0f - gs) * h) * map->gainAt (pos);
+        };
 
         Meter orig (sr), now (sr);
         const auto warmup = (int64_t) (sr * 0.2);
@@ -392,7 +497,7 @@ namespace Analysis
             for (int k = 0; k < n; ++k)
             {
                 orig.warm (buf[(size_t) k]);
-                now.warm (buf[(size_t) k] * map->gainAt (p + k));
+                now.warm (process (buf[(size_t) k], p + k));
             }
         }
 
@@ -405,7 +510,7 @@ namespace Analysis
             {
                 const auto g = map->gainAt (p + k);
                 orig.add (buf[(size_t) k]);
-                now.add (buf[(size_t) k] * g);
+                now.add (process (buf[(size_t) k], p + k));
                 gainSum += juce::Decibels::gainToDecibels (g, -120.0f);
             }
         }

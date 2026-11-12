@@ -716,6 +716,8 @@ void WaveformView::paint (juce::Graphics& g)
         juce::Graphics::ScopedSaveState ss (g);
         g.reduceClipRegion (area);
         paintWave (g, area);
+        if (showSibilance())
+            paintSibilanceMarks (g, area);
         if (tool == Tool::blob || tool == Tool::peak || tool == Tool::select)
             paintSpots (g, area);
         paintThreshold (g, area);   // diamonds on top
@@ -926,7 +928,7 @@ void WaveformView::paintWave (juce::Graphics& g, juce::Rectangle<int> area)
 
         float lo, hi, rms;
         peaks.getRange (cap, s0, s1, lo, hi, rms);
-        const auto gain = juce::Decibels::decibelsToGain (EditOps::totalDbAt (s, (s0 + s1) / 2, sr), -120.0f);
+        const auto gain = juce::Decibels::decibelsToGain (EditOps::displayDbAt (s, (s0 + s1) / 2, sr), -120.0f);
         if (std::abs (gain - 1.0f) > 0.006f) anyChange = true;
 
         // when zoomed in to single samples there is no "body": the line itself is the wave
@@ -951,6 +953,28 @@ void WaveformView::paintWave (juce::Graphics& g, juce::Rectangle<int> area)
     g.fillPath (edited);
     g.setColour (Theme::wave.brighter (0.12f));
     g.fillPath (body);
+
+    // sibilance shows in white
+    if (showSibilance())
+    {
+        refreshSibilance();
+        juce::RectangleList<int> sRects;
+        for (auto& sb : sibs)
+        {
+            const auto x0 = posToX ((double) sb.start), x1 = posToX ((double) sb.end);
+            if (x1 < area.getX() || x0 > area.getRight()) continue;
+            sRects.add (juce::Rectangle<float> (x0, (float) area.getY(), juce::jmax (1.0f, x1 - x0), (float) area.getHeight()).getSmallestIntegerContainer());
+        }
+        if (! sRects.isEmpty())
+        {
+            juce::Graphics::ScopedSaveState ss (g);
+            g.reduceClipRegion (sRects);
+            g.setColour (juce::Colour (0xffe9edf2));
+            g.fillPath (edited);
+            g.setColour (juce::Colour (0xfff7f9fb));
+            g.fillPath (body);
+        }
+    }
     juce::ignoreUnused (area);
 }
 
@@ -966,7 +990,7 @@ void WaveformView::paintThreshold (juce::Graphics& g, juce::Rectangle<int> area)
 
     refreshVisiblePeaks();
 
-    if (tool != Tool::peak)
+    if (tool != Tool::peak && tool != Tool::sibilance)
     {
         // small white markers over every peak above the line
         g.setColour (juce::Colours::white.withAlpha (0.9f));
@@ -997,7 +1021,7 @@ void WaveformView::paintThreshold (juce::Graphics& g, juce::Rectangle<int> area)
         g.setColour (selected ? juce::Colours::white : juce::Colour (0xff1c2129));
         g.strokePath (dia, juce::PathStrokeType (1.4f));
 
-        if (selected || (d.spot >= 0 && drag == Drag::diamond))
+        if (tool == Tool::peak && (selected || (d.spot >= 0 && drag == Drag::diamond)))
         {
             const auto db = proc.getEdits().spots[(size_t) d.spot].db;
             juce::Rectangle<float> pill (x - 34.0f, y - 34.0f, 68.0f, 22.0f);
@@ -1014,6 +1038,8 @@ void WaveformView::paintThreshold (juce::Graphics& g, juce::Rectangle<int> area)
 
 void WaveformView::refreshDiamonds()
 {
+    if (diamondsTool != tool) diamondsDirty = true;
+    diamondsTool = tool;
     if (! diamondsDirty)
         return;
     diamondsDirty = false;
@@ -1033,18 +1059,37 @@ void WaveformView::refreshDiamonds()
     for (int i = 0; i < (int) edits.spots.size(); ++i)
     {
         const auto& sp = edits.spots[(size_t) i];
-        if (sp.kind == SpotEdit::blob || sp.end < v0 || sp.start > v1)
+        const bool wanted = tool == Tool::sibilance ? SpotEdit::isSibilance (sp.kind) : SpotEdit::isPeak (sp.kind);
+        if (! wanted || sp.end < v0 || sp.start > v1)
             continue;
         Diamond d;
         d.a = sp.start; d.b = sp.end; d.spot = i;
         d.level = 0.0f; d.at = (sp.start + sp.end) / 2;
         for (auto p = sp.start; p < sp.end; ++p)
         {
-            const auto v = std::abs (cap.get (p)) * juce::Decibels::decibelsToGain (EditOps::totalDbAt (edits, p, sr), -120.0f);
+            const auto v = std::abs (cap.get (p)) * juce::Decibels::decibelsToGain (EditOps::displayDbAt (edits, p, sr), -120.0f);
             if (v > d.level) { d.level = v; d.at = p; }
         }
-        d.over = d.level > thr;
+        d.over = tool == Tool::sibilance || d.level > thr;
         diamonds.push_back (d);
+    }
+
+    if (tool == Tool::sibilance)
+    {
+        // every detected S that has no edit yet
+        refreshSibilance();
+        for (auto& sb : sibs)
+        {
+            if (sb.end < v0 || sb.start > v1) continue;
+            const bool covered = std::any_of (diamonds.begin(), diamonds.end(), [&] (const Diamond& d) { return d.a < sb.end && d.b > sb.start; });
+            if (covered) continue;
+            Diamond d;
+            d.a = sb.start; d.b = sb.end; d.at = sb.at;
+            d.level = sb.level * juce::Decibels::decibelsToGain (EditOps::displayDbAt (edits, sb.at, sr), -120.0f);
+            d.spot = -1; d.over = true;
+            diamonds.push_back (d);
+        }
+        return;
     }
 
     // peaks over the line that nobody touched yet
@@ -1156,6 +1201,81 @@ void WaveformView::paintEnvelope (juce::Graphics& g, juce::Rectangle<int> area)
             g.setColour (Theme::envLine);
             g.drawRect (h, 2.0f);
         }
+}
+
+//==============================================================================
+// Sibilance
+//==============================================================================
+bool WaveformView::showSibilance() const
+{
+    return tool == Tool::sibilance || (bool) proc.uiState.getProperty ("showSib", false);
+}
+
+void WaveformView::refreshSibilance()
+{
+    const auto& cap = proc.getCapture();
+    const auto sens = proc.getSibSensitivity();
+    const auto freq = proc.getEdits().sibFreq;
+    if (juce::exactlyEqual (sens, sibSens) && juce::exactlyEqual (freq, sibFreqCached) && cap.getGeneration() == sibGeneration)
+        return;
+    sibSens = sens;
+    sibFreqCached = freq;
+    sibGeneration = cap.getGeneration();
+    sibs = cap.hasData() ? Analysis::detectSibilance (cap, cap.getWrittenStart(), cap.getWrittenEnd(), sens, freq)
+                         : std::vector<Analysis::Sibilant>();
+    diamondsDirty = true;
+}
+
+float WaveformView::sibDbAt (const Analysis::Sibilant& sb) const
+{
+    float db = 0.0f;
+    for (auto& sp : proc.getEdits().spots)
+        if (SpotEdit::isSibilance (sp.kind) && sp.start < sb.end && sp.end > sb.start)
+            db += sp.db;
+    return db;
+}
+
+int WaveformView::selectedSibilant()
+{
+    refreshSibilance();
+    for (auto i : selectedSpotIndices())
+    {
+        const auto& sp = proc.getEdits().spots[(size_t) i];
+        if (! SpotEdit::isSibilance (sp.kind)) continue;
+        for (int k = 0; k < (int) sibs.size(); ++k)
+            if (sibs[(size_t) k].start < sp.end && sibs[(size_t) k].end > sp.start)
+                return k;
+    }
+    return -1;
+}
+
+void WaveformView::paintSibilanceMarks (juce::Graphics& g, juce::Rectangle<int> area)
+{
+    refreshSibilance();
+    const auto sel = selectedSibilant();
+    for (int k = 0; k < (int) sibs.size(); ++k)
+    {
+        const auto& sb = sibs[(size_t) k];
+        const auto x0 = posToX ((double) sb.start), x1 = posToX ((double) sb.end);
+        if (x1 < area.getX() || x0 > area.getRight()) continue;
+        const bool selected = k == sel;
+
+        juce::Rectangle<float> r (x0, (float) area.getY() + 14.0f, juce::jmax (2.0f, x1 - x0), (float) area.getHeight() - 28.0f);
+        g.setColour (juce::Colours::white.withAlpha (selected ? 0.13f : 0.06f));
+        g.fillRoundedRectangle (r, 5.0f);
+
+        // "S" (and its gain) at the bottom
+        const auto db = sibDbAt (sb);
+        const bool showDb = selected || std::abs (db) > 0.05f;
+        const auto label = showDb ? "S  " + dbText (db, 1) : juce::String ("S");
+        const auto w = showDb ? 86.0f : 24.0f;
+        juce::Rectangle<float> pill (r.getCentreX() - w * 0.5f, r.getBottom() - 30.0f, w, 22.0f);
+        g.setColour (juce::Colour (selected ? 0xffffffff : 0xffdfe4ea).withAlpha (tool == Tool::sibilance || selected ? 1.0f : 0.8f));
+        g.fillRoundedRectangle (pill, 5.0f);
+        g.setColour (juce::Colour (0xff14161a));
+        g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
+        g.drawText (label, pill, juce::Justification::centred);
+    }
 }
 
 //==============================================================================
@@ -1354,11 +1474,13 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
         }
 
         case Tool::peak:
+        case Tool::sibilance:
         {
             selA = selB = 0;
             activeRange = -1;
             refreshVisiblePeaks();
             refreshDiamonds();
+            const auto manualKind = tool == Tool::sibilance ? (int) SpotEdit::sib : (int) SpotEdit::peak;
             const auto di = diamondNear (e.position);
             if (di < 0)
             {
@@ -1375,11 +1497,11 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
             if (d.spot >= 0 && d.spot < (int) s.spots.size())
             {
                 idx = d.spot;
-                s.spots[(size_t) idx].kind = SpotEdit::peak;     // moved by hand: Reduction leaves it alone now
+                s.spots[(size_t) idx].kind = manualKind;     // moved by hand: Reduction leaves it alone now
             }
             else
             {
-                idx = EditOps::ensureSpot (s, d.a, d.b, SpotEdit::peak);
+                idx = EditOps::ensureSpot (s, d.a, d.b, manualKind);
             }
             const auto key = s.spots[(size_t) idx];
             proc.setEdits (s, false);
@@ -1606,7 +1728,7 @@ void WaveformView::mouseUp (const juce::MouseEvent& e)
                 EditOps::pruneSpots (s);
             if (s.spots.size() != before)
                 proc.setEdits (s, false);
-            proc.commitDrag (tool == Tool::peak ? "Peak Gain" : "Blob Gain");
+            proc.commitDrag (tool == Tool::peak ? "Peak Gain" : (tool == Tool::sibilance ? "Sibilance Gain" : "Blob Gain"));
             break;
         }
         case Drag::ruler:
