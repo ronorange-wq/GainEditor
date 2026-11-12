@@ -734,9 +734,9 @@ void WaveformView::paint (juce::Graphics& g)
             g.drawRoundedRectangle (r, 7.0f, 1.6f);
             const auto db = (activeRange >= 0 && activeRange < (int) proc.getEdits().ranges.size()) ? proc.getEdits().ranges[(size_t) activeRange].db : 0.0f;
             const auto visible = r.getIntersection (area.toFloat());
-            if (visible.getWidth() > 46.0f)
+            if (visible.getWidth() > 6.0f)
             {
-                const auto w = juce::jmin (96.0f, visible.getWidth() - 10.0f);
+                const auto w = 86.0f;   // always wide enough for "-12.5 dB", even over a narrow selection
                 juce::Rectangle<float> pill (visible.getCentreX() - w * 0.5f, r.getY() + 10.0f, w, 26.0f);
                 g.setColour (juce::Colour (0xf0213a5c));
                 g.fillRoundedRectangle (pill, 6.0f);
@@ -1141,9 +1141,9 @@ void WaveformView::paintSpots (juce::Graphics& g, juce::Rectangle<int> area)
 
         // "+3.0 dB" pill at the top of the blob
         const auto visible = r.getIntersection (area.toFloat());
-        if (visible.getWidth() > 46.0f)
+        if (visible.getWidth() > 6.0f)
         {
-            const auto w = juce::jmin (96.0f, visible.getWidth() - 10.0f);
+            const auto w = 86.0f;
             juce::Rectangle<float> pill (visible.getCentreX() - w * 0.5f, r.getY() + 10.0f, w, 26.0f);
             g.setColour (juce::Colour (selected ? 0xf0213a5c : 0xc8213a5c));
             g.fillRoundedRectangle (pill, 6.0f);
