@@ -63,8 +63,16 @@ public:
     bool isHostPlaying() const noexcept { return hostPlaying.load(); }
     double getSampleRateForTimeline() const noexcept { return capture.getSampleRate(); }
 
-    /** Re-detects blobs (whole take, or only [a,b) when b > a). Undoable. */
-    void redetectBlobs (float resolution, int64_t a = 0, int64_t b = 0);
+    // ---- Peak threshold (dBFS), shown as a line on the waveform ----
+    float getThresholdDb() const;
+    void setThresholdDb (float db);
+
+    // ---- Ableton transport through a virtual MIDI port called "Gain Editor" ----
+    bool isAbletonSync() const;
+    void setAbletonSync (bool on);
+    bool hasMidiPort() const noexcept { return midiOut != nullptr; }
+    /** Sends Play (note C4 / 60) or Stop (C#4 / 61) on MIDI channel 16. */
+    void sendTransport (bool play);
 
     // Editor UI state kept with the project.
     juce::ValueTree uiState { "UI" };
@@ -89,6 +97,8 @@ private:
     double currentSampleRate = 48000.0;
 
     // The recording is stored inside the Ableton project (FLAC), encoded once per change.
+    std::shared_ptr<juce::MidiOutput> midiOut;
+
     juce::MemoryBlock encodedAudio;
     uint64_t encodedGeneration = std::numeric_limits<uint64_t>::max();
     juce::CriticalSection encodeLock;

@@ -66,36 +66,46 @@ GainBadge::GainBadge()
     resetButton.onClick = [this] { if (onReset) onReset(); };
     resetButton.setTooltip ("Return this part to how it was recorded (Cmd+R)");
     addAndMakeVisible (resetButton);
-    setSize (196, 44);
+    setInterceptsMouseClicks (false, true);   // only the Reset button takes clicks
+    setSize (236, 40);
 }
 
-void GainBadge::setDb (float db)
+void GainBadge::setInfo (const juce::String& what, float db)
 {
-    if (std::abs (db - value) > 0.0001f) { value = db; repaint(); }
+    if (what != label || std::abs (db - value) > 0.0001f)
+    {
+        label = what;
+        value = db;
+        repaint();
+    }
+}
+
+static juce::String dbText (float v, int decimals = 1)
+{
+    const auto minus = juce::String (juce::CharPointer_UTF8 ("\xe2\x88\x92"));
+    if (std::abs (v) < 0.005f) return "0.0 dB";
+    return (v > 0.0f ? juce::String ("+") : minus) + juce::String (std::abs (v), decimals) + " dB";
 }
 
 void GainBadge::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds().toFloat().reduced (1.0f);
-    g.setColour (juce::Colours::black.withAlpha (0.35f));
-    g.fillRoundedRectangle (r.translated (0, 3), 10.0f);
-    g.setColour (juce::Colour (0xff121418));
-    g.fillRoundedRectangle (r, 10.0f);
+    g.setColour (juce::Colour (0xeb121418));
+    g.fillRoundedRectangle (r, 9.0f);
     g.setColour (juce::Colour (0xff3a3f47));
-    g.drawRoundedRectangle (r, 10.0f, 1.0f);
+    g.drawRoundedRectangle (r, 9.0f, 1.0f);
 
+    g.setColour (Theme::textDim);
+    g.setFont (juce::FontOptions (14.0f));
+    g.drawText (label, 12, 0, 70, getHeight(), juce::Justification::centredLeft);
     g.setColour (juce::Colours::white);
-    g.setFont (juce::FontOptions (18.0f, juce::Font::bold));
-    juce::String txt = (value > 0.0f ? "+" : (value < 0.0f ? juce::String (juce::CharPointer_UTF8 ("\xe2\x88\x92")) : juce::String()))
-                       + juce::String (std::abs (value), std::abs (value) < 10.0f ? 2 : 1) + " dB";
-    g.drawText (txt, 12, 0, 92, getHeight(), juce::Justification::centredLeft);
-    g.setColour (juce::Colour (0xff3a3f47));
-    g.fillRect (106, 8, 1, getHeight() - 16);
+    g.setFont (juce::FontOptions (17.0f, juce::Font::bold));
+    g.drawText (dbText (value, std::abs (value) < 10.0f ? 2 : 1), 70, 0, 90, getHeight(), juce::Justification::centredLeft);
 }
 
 void GainBadge::resized()
 {
-    resetButton.setBounds (114, 6, getWidth() - 120, getHeight() - 12);
+    resetButton.setBounds (getWidth() - 72, 6, 66, getHeight() - 12);
 }
 
 //==============================================================================
@@ -106,14 +116,12 @@ WaveformView::WaveformView (GainEditorProcessor& p, PeakCache& pc) : proc (p), p
     addChildComponent (badge);
     badge.onReset = [this]
     {
-        // Envelope point badge: Reset removes that point. Otherwise: reset the selected part.
         if (tool == Tool::envelope && selectedPoint >= 0)
             deleteSelected();
         else
             resetTarget (EditOps::resetEverything);
     };
     proc.addChangeListener (this);
-    setWantsKeyboardFocus (false);
 }
 
 WaveformView::~WaveformView()
@@ -121,34 +129,50 @@ WaveformView::~WaveformView()
     proc.removeChangeListener (this);
 }
 
+void WaveformView::changed()
+{
+    updateBadge();
+    repaint();
+    if (onStateChanged) onStateChanged();
+}
+
+void WaveformView::grabFocusForKeys()
+{
+    // Ableton keeps the keyboard unless the plugin asks for it on every click.
+    if (auto* ed = findParentComponentOfClass<juce::AudioProcessorEditor>())
+        ed->grabKeyboardFocus();
+}
+
 void WaveformView::changeListenerCallback (juce::ChangeBroadcaster*)
 {
-    const auto& r = proc.getEdits().ranges;
-    if (activeRange >= (int) r.size())
+    if (activeRange >= (int) proc.getEdits().ranges.size())
         activeRange = -1;
     if (selectedPoint >= (int) proc.getEdits().envelope.size())
         selectedPoint = -1;
-
-    // forget selected blobs that no longer exist
-    for (auto it = selectedBlobStarts.begin(); it != selectedBlobStarts.end();)
-    {
-        const auto& bl = proc.getEdits().blobs;
-        const bool exists = std::any_of (bl.begin(), bl.end(), [&] (const Blob& b) { return b.start == *it; });
-        it = exists ? std::next (it) : selectedBlobStarts.erase (it);
-    }
-
+    peaksDirty = true;
+    peakCount = -1;
     updateBadge();
     repaint();
 }
 
 juce::Rectangle<int> WaveformView::waveArea() const
 {
-    return getLocalBounds().withTrimmedTop (rulerHeight);
+    return getLocalBounds().withTrimmedTop (rulerHeight).reduced (scaleWidth, 0);
 }
 
 void WaveformView::resized()
 {
+    badge.setTopLeftPosition (waveArea().getX() + 10, waveArea().getY() + 10);
+    peaksDirty = true;
     updateBadge();
+}
+
+float WaveformView::ampToY (float amp, bool upper) const noexcept
+{
+    const auto a = waveArea().toFloat();
+    const auto mid = a.getCentreY();
+    const auto half = (a.getHeight() * 0.5f - 10.0f) * vZoom;
+    return upper ? mid - amp * half : mid + amp * half;
 }
 
 float WaveformView::dbToY (float db) const noexcept
@@ -175,38 +199,38 @@ void WaveformView::setTool (Tool t)
 {
     tool = t;
     selectedPoint = -1;
-    updateBadge();
-    repaint();
-    if (onStateChanged) onStateChanged();
+    hoverPos = -1;
+    changed();
 }
 
 void WaveformView::zoomBy (double factor, double anchorX)
 {
     if (anchorX < 0.0)
-        anchorX = getWidth() * 0.5;
+        anchorX = waveArea().getCentreX();
     const auto anchorPos = xToPos ((float) anchorX);
     spp = juce::jlimit (0.05, 200000.0, spp / factor);
-    viewStart = anchorPos - anchorX * spp;
-    scrollTo (viewStart);
+    scrollTo (anchorPos - (anchorX - waveArea().getX()) * spp);
 }
 
 void WaveformView::zoomToFit()
 {
     const auto& c = proc.getCapture();
-    if (! c.hasData() || getWidth() <= 0)
+    const auto w = waveArea().getWidth();
+    if (! c.hasData() || w <= 0)
         return;
     const auto a = (double) c.getWrittenStart(), b = (double) c.getWrittenEnd();
-    spp = juce::jmax (0.05, (b - a) / (getWidth() * 0.98));
+    spp = juce::jmax (0.05, (b - a) / (w * 0.98));
     scrollTo (a - (b - a) * 0.01);
 }
 
 void WaveformView::zoomToSelection()
 {
     int64_t a, b;
-    if (! getTargetRegion (a, b) || getWidth() <= 0)
+    const auto w = waveArea().getWidth();
+    if (! getTargetRegion (a, b) || w <= 0)
         return;
     const auto len = (double) (b - a);
-    spp = juce::jmax (0.05, len * 1.2 / getWidth());
+    spp = juce::jmax (0.05, len * 1.2 / w);
     scrollTo ((double) a - len * 0.1);
 }
 
@@ -219,16 +243,123 @@ void WaveformView::zoomVertical (float factor)
 void WaveformView::scrollTo (double startSample)
 {
     viewStart = juce::jmax (-spp * 20.0, startSample);
-    updateBadge();
-    repaint();
-    if (onStateChanged) onStateChanged();
+    peaksDirty = true;
+    changed();
 }
 
 void WaveformView::followPlayhead (int64_t pos)
 {
     const auto x = posToX ((double) pos);
-    if (x > getWidth() * 0.92f || x < 0.0f)
-        scrollTo ((double) pos - getWidth() * 0.08 * spp);
+    const auto a = waveArea();
+    if (x > a.getX() + a.getWidth() * 0.92f || x < a.getX())
+        scrollTo ((double) pos - a.getWidth() * 0.08 * spp);
+}
+
+float WaveformView::currentResolution() const
+{
+    return Analysis::resolutionForZoom (spp, sampleRate());
+}
+
+//==============================================================================
+// Cached detection
+//==============================================================================
+void WaveformView::refreshSegments()
+{
+    const auto& cap = proc.getCapture();
+    if (! cap.hasData())
+    {
+        segments.clear();
+        return;
+    }
+
+    auto r = std::round (currentResolution() * 40.0f) / 40.0f;   // re-detect only when the zoom really changed
+    const auto visA = (int64_t) viewStart, visB = (int64_t) getViewEnd();
+    const auto gen = cap.getGeneration();
+
+    if (std::abs (r - segRes) < 0.001f && visA >= segA && visB <= segB && gen == segGeneration)
+        return;
+
+    const auto span = visB - visA;
+    segA = juce::jmax (cap.getWrittenStart(), visA - span);
+    segB = juce::jmin (cap.getWrittenEnd(), visB + span);
+    segRes = r;
+    segGeneration = gen;
+    segments = segB > segA ? Analysis::detectBlobs (cap, segA, segB, r) : std::vector<Analysis::Segment>();
+}
+
+const Analysis::Segment* WaveformView::segmentAt (int64_t pos) const
+{
+    auto it = std::upper_bound (segments.begin(), segments.end(), pos,
+                                [] (int64_t p, const Analysis::Segment& s) { return p < s.start; });
+    if (it == segments.begin())
+        return nullptr;
+    --it;
+    return pos < it->end ? &*it : nullptr;
+}
+
+void WaveformView::refreshVisiblePeaks()
+{
+    if (! peaksDirty)
+        return;
+    peaksDirty = false;
+    const auto margin = (int64_t) (spp * 20.0);
+    visiblePeaks = Analysis::findPeaks (proc.getCapture(), proc.getEdits(),
+                                        (int64_t) viewStart - margin, (int64_t) getViewEnd() + margin, thresholdGain());
+}
+
+const Analysis::Peak* WaveformView::peakNear (int64_t pos) const
+{
+    const auto slack = (int64_t) (spp * 4.0);
+    const Analysis::Peak* best = nullptr;
+    int64_t bestDist = std::numeric_limits<int64_t>::max();
+    for (auto& p : visiblePeaks)
+    {
+        if (pos < p.start - slack || pos > p.end + slack)
+            continue;
+        const auto d = std::abs (pos - p.at);
+        if (d < bestDist) { bestDist = d; best = &p; }
+    }
+    return best;
+}
+
+int WaveformView::countPeaksAbove()
+{
+    if (peakCount < 0)
+    {
+        const auto& c = proc.getCapture();
+        peakCount = c.hasData() ? (int) Analysis::findPeaks (c, proc.getEdits(), c.getWrittenStart(), c.getWrittenEnd(), thresholdGain()).size() : 0;
+    }
+    return peakCount;
+}
+
+void WaveformView::selectAllPeaks()
+{
+    const auto& c = proc.getCapture();
+    if (! c.hasData()) return;
+    auto pk = Analysis::findPeaks (c, proc.getEdits(), c.getWrittenStart(), c.getWrittenEnd(), thresholdGain());
+    auto s = proc.getEdits();
+    selectedSpots.clear();
+    for (auto& p : pk)
+    {
+        int64_t a, b;
+        Analysis::peakRegion (p, sampleRate(), a, b);
+        EditOps::ensureSpot (s, a, b, SpotEdit::peak);
+        selectedSpots.push_back ({ a, b, SpotEdit::peak });
+    }
+    selA = selB = 0;
+    proc.setEdits (s, false);
+    changed();
+}
+
+void WaveformView::tameAllPeaks()
+{
+    const auto& c = proc.getCapture();
+    if (! c.hasData()) return;
+    auto s = proc.getEdits();
+    int64_t a = c.getWrittenStart(), b = c.getWrittenEnd();
+    if (hasSelection()) { a = selA; b = selB; }   // only inside the selection, if there is one
+    Analysis::tamePeaks (s, c, a, b, thresholdGain());
+    proc.setEdits (s, true, "Tame Peaks");
 }
 
 //==============================================================================
@@ -248,16 +379,6 @@ int WaveformView::rangeEditAt (int64_t pos) const
     return best;
 }
 
-int WaveformView::blobIndexAt (int64_t pos) const
-{
-    const auto& bl = proc.getEdits().blobs;
-    auto it = std::upper_bound (bl.begin(), bl.end(), pos, [] (int64_t p, const Blob& b) { return p < b.start; });
-    if (it == bl.begin())
-        return -1;
-    --it;
-    return pos < it->end ? (int) std::distance (bl.begin(), it) : -1;
-}
-
 int WaveformView::envPointNear (juce::Point<float> p) const
 {
     const auto& e = proc.getEdits().envelope;
@@ -270,14 +391,36 @@ int WaveformView::envPointNear (juce::Point<float> p) const
     return -1;
 }
 
-std::vector<int> WaveformView::selectedBlobIndices() const
+std::vector<int> WaveformView::selectedSpotIndices() const
 {
     std::vector<int> out;
-    const auto& bl = proc.getEdits().blobs;
-    for (int i = 0; i < (int) bl.size(); ++i)
-        if (selectedBlobStarts.count (bl[(size_t) i].start) > 0)
-            out.push_back (i);
+    const auto& sp = proc.getEdits().spots;
+    for (auto& k : selectedSpots)
+        for (int i = 0; i < (int) sp.size(); ++i)
+            if (sp[(size_t) i].sameRegion (k.start, k.end) && sp[(size_t) i].kind == k.kind)
+            {
+                out.push_back (i);
+                break;
+            }
+    std::sort (out.begin(), out.end());
+    out.erase (std::unique (out.begin(), out.end()), out.end());
     return out;
+}
+
+void WaveformView::selectSpot (const SpotEdit& s, bool add)
+{
+    SpotKey k { s.start, s.end, s.kind };
+    auto it = std::find_if (selectedSpots.begin(), selectedSpots.end(), [&] (const SpotKey& o)
+                            { return o.start == k.start && o.end == k.end && o.kind == k.kind; });
+    if (add)
+    {
+        if (it != selectedSpots.end()) selectedSpots.erase (it);
+        else selectedSpots.push_back (k);
+    }
+    else if (it == selectedSpots.end())
+    {
+        selectedSpots = { k };
+    }
 }
 
 bool WaveformView::getTargetRegion (int64_t& a, int64_t& b) const
@@ -287,12 +430,12 @@ bool WaveformView::getTargetRegion (int64_t& a, int64_t& b) const
         a = selA; b = selB;
         return true;
     }
-    auto idx = selectedBlobIndices();
+    auto idx = selectedSpotIndices();
     if (! idx.empty())
     {
-        const auto& bl = proc.getEdits().blobs;
-        a = bl[(size_t) idx.front()].start;
-        b = bl[(size_t) idx.back()].end;
+        const auto& sp = proc.getEdits().spots;
+        a = std::numeric_limits<int64_t>::max(); b = 0;
+        for (auto i : idx) { a = juce::jmin (a, sp[(size_t) i].start); b = juce::jmax (b, sp[(size_t) i].end); }
         return true;
     }
     return false;
@@ -302,11 +445,9 @@ void WaveformView::clearSelection()
 {
     selA = selB = 0;
     activeRange = -1;
-    selectedBlobStarts.clear();
+    selectedSpots.clear();
     selectedPoint = -1;
-    updateBadge();
-    repaint();
-    if (onStateChanged) onStateChanged();
+    changed();
 }
 
 //==============================================================================
@@ -314,16 +455,25 @@ void WaveformView::clearSelection()
 //==============================================================================
 void WaveformView::resetTarget (EditOps::ResetWhat what)
 {
+    static const char* names[] = { "Reset Selection", "Reset Range Gain", "Reset Envelope", "Reset Blobs & Peaks" };
+
+    // Selected spots (no range selection): remove exactly those spots.
+    if (! hasSelection() && ! selectedSpots.empty() && (what == EditOps::resetEverything || what == EditOps::resetSpots))
+    {
+        auto s = proc.getEdits();
+        auto idx = selectedSpotIndices();
+        for (auto it = idx.rbegin(); it != idx.rend(); ++it)
+            s.spots.erase (s.spots.begin() + *it);
+        selectedSpots.clear();
+        proc.setEdits (s, true, names[(int) what]);
+        return;
+    }
+
     int64_t a, b;
     if (! getTargetRegion (a, b))
         return;
-
-    static const char* names[] = { "Reset Selection", "Reset Range Gain", "Reset Envelope", "Reset Blobs" };
-    auto s = EditOps::resetRegion (proc.getEdits(), a, b, what, sampleRate());
-
-    // If the selection was exactly one range edit, that edit is gone now.
     activeRange = -1;
-    proc.setEdits (s, true, names[(int) what]);
+    proc.setEdits (EditOps::resetRegion (proc.getEdits(), a, b, what, sampleRate()), true, names[(int) what]);
 }
 
 void WaveformView::resetEverythingWithConfirm()
@@ -332,7 +482,7 @@ void WaveformView::resetEverythingWithConfirm()
     juce::AlertWindow::showAsync (juce::MessageBoxOptions()
                                       .withIconType (juce::MessageBoxIconType::WarningIcon)
                                       .withTitle ("Reset All Edits")
-                                      .withMessage ("Remove every gain change (Range, Envelope and Blob) from the whole take?\nYou can still undo this.")
+                                      .withMessage ("Remove every gain change (Range, Envelope, Blob and Peak) from the whole take?\nYou can still undo this.")
                                       .withButton ("Reset All")
                                       .withButton ("Cancel")
                                       .withAssociatedComponent (this),
@@ -341,6 +491,7 @@ void WaveformView::resetEverythingWithConfirm()
                                       if (safe == nullptr || result != 1)
                                           return;
                                       safe->activeRange = -1;
+                                      safe->selectedSpots.clear();
                                       safe->proc.setEdits (EditOps::resetAll (safe->proc.getEdits()), true, "Reset All Edits");
                                   });
 }
@@ -357,12 +508,12 @@ void WaveformView::nudgeSelected (float db)
         return;
     }
 
-    auto blobIdx = selectedBlobIndices();
-    if (! blobIdx.empty() && (tool == Tool::blob || tool == Tool::select))
+    auto idx = selectedSpotIndices();
+    if (! idx.empty())
     {
-        for (auto i : blobIdx)
-            s.blobs[(size_t) i].db = juce::jlimit (-48.0f, 24.0f, s.blobs[(size_t) i].db + db);
-        proc.setEdits (s, true, "Nudge Blob Gain");
+        for (auto i : idx)
+            s.spots[(size_t) i].db = juce::jlimit (-48.0f, 24.0f, s.spots[(size_t) i].db + db);
+        proc.setEdits (s, true, "Nudge Gain");
         return;
     }
 
@@ -392,50 +543,23 @@ void WaveformView::deleteSelected()
     resetTarget (EditOps::resetEverything);
 }
 
-void WaveformView::mergeSelectedBlobs()
-{
-    auto idx = selectedBlobIndices();
-    if (idx.size() < 2)
-        return;
-
-    auto s = proc.getEdits();
-    const auto first = idx.front(), last = idx.back();
-    Blob m = s.blobs[(size_t) first];
-    m.end = s.blobs[(size_t) last].end;
-    s.blobs.erase (s.blobs.begin() + first, s.blobs.begin() + last + 1);
-    s.blobs.insert (s.blobs.begin() + first, m);
-    selectedBlobStarts = { m.start };
-    proc.setEdits (s, true, "Merge Blobs");
-}
-
-void WaveformView::applyResolutionToSelection (float resolution)
-{
-    int64_t a, b;
-    if (! getTargetRegion (a, b))
-        return;
-    selectedBlobStarts.clear();
-    proc.redetectBlobs (resolution, a, b);
-}
-
 void WaveformView::showContextMenu()
 {
-    const bool target = hasSelection() || ! selectedBlobStarts.empty();
+    int64_t a, b;
+    const bool target = getTargetRegion (a, b);
     juce::PopupMenu m;
     m.addSectionHeader ("Reset");
     m.addItem (1, "Reset Selection  (Cmd+R)", target);
     m.addItem (2, "Reset Range Gain Only", target);
     m.addItem (3, "Reset Envelope in Selection", target);
-    m.addItem (4, "Reset Blobs in Selection", target);
+    m.addItem (4, "Reset Blobs & Peaks in Selection", target);
     m.addSeparator();
     m.addItem (5, "Reset All Edits...  (Shift+Cmd+R)");
     m.addSeparator();
     m.addItem (6, "Show Loudness  (L)", target);
     m.addItem (7, "Zoom to Selection  (Z)", target);
-    if (tool == Tool::blob)
-    {
-        m.addSeparator();
-        m.addItem (8, "Merge Selected Blobs  (M)", selectedBlobStarts.size() > 1);
-    }
+    m.addSeparator();
+    m.addItem (8, "Tame Peaks Above Threshold");
     m.addSeparator();
     m.addItem (9, "Undo", proc.getUndoManager().canUndo());
     m.addItem (10, "Redo", proc.getUndoManager().canRedo());
@@ -450,11 +574,11 @@ void WaveformView::showContextMenu()
                              case 1: safe->resetTarget (EditOps::resetEverything); break;
                              case 2: safe->resetTarget (EditOps::resetRanges); break;
                              case 3: safe->resetTarget (EditOps::resetEnvelope); break;
-                             case 4: safe->resetTarget (EditOps::resetBlobs); break;
+                             case 4: safe->resetTarget (EditOps::resetSpots); break;
                              case 5: safe->resetEverythingWithConfirm(); break;
                              case 6: if (safe->onShowLoudness) safe->onShowLoudness(); break;
                              case 7: safe->zoomToSelection(); break;
-                             case 8: safe->mergeSelectedBlobs(); break;
+                             case 8: safe->tameAllPeaks(); break;
                              case 9: safe->proc.getUndoManager().undo(); break;
                              case 10: safe->proc.getUndoManager().redo(); break;
                              default: break;
@@ -463,57 +587,39 @@ void WaveformView::showContextMenu()
 }
 
 //==============================================================================
-// Badge
+// Badge (fixed in the corner)
 //==============================================================================
 void WaveformView::updateBadge()
 {
     const auto& s = proc.getEdits();
+    juce::String what;
     float db = 0.0f;
-    float centreX = 0.0f, top = 0.0f;
     bool show = false;
-    const auto a = waveArea().toFloat();
 
     if (tool == Tool::envelope && selectedPoint >= 0 && selectedPoint < (int) s.envelope.size())
     {
-        const auto& p = s.envelope[(size_t) selectedPoint];
-        db = p.db;
-        centreX = posToX ((double) p.pos);
-        top = dbToY (p.db) + 18.0f;
-        show = true;
+        what = "Point"; db = s.envelope[(size_t) selectedPoint].db; show = true;
     }
-    else if ((tool == Tool::blob || tool == Tool::select) && ! selectedBlobStarts.empty())
+    else if (! selectedSpots.empty() && ! hasSelection())
     {
-        auto idx = selectedBlobIndices();
+        auto idx = selectedSpotIndices();
         if (! idx.empty())
         {
-            const auto& f = s.blobs[(size_t) idx.front()];
-            const auto& l = s.blobs[(size_t) idx.back()];
-            db = f.db;
-            centreX = (posToX ((double) f.start) + posToX ((double) l.end)) * 0.5f;
-            top = a.getCentreY() + a.getHeight() * 0.18f;
+            const auto& sp = s.spots[(size_t) idx.front()];
+            what = idx.size() > 1 ? juce::String ((int) idx.size()) + " sel." : (sp.kind == SpotEdit::peak ? "Peak" : "Blob");
+            db = sp.db;
             show = true;
         }
     }
     else if (hasSelection())
     {
+        what = "Range";
         db = (activeRange >= 0 && activeRange < (int) s.ranges.size()) ? s.ranges[(size_t) activeRange].db : 0.0f;
-        centreX = (posToX ((double) selA) + posToX ((double) selB)) * 0.5f;
-        top = a.getY() + a.getHeight() * 0.18f;
         show = true;
     }
 
-    if (show && centreX > -100.0f && centreX < (float) getWidth() + 100.0f)
-    {
-        badge.setDb (db);
-        auto x = juce::jlimit (4, juce::jmax (4, getWidth() - badge.getWidth() - 4), (int) (centreX - badge.getWidth() * 0.5f));
-        auto y = juce::jlimit ((int) a.getY() + 4, juce::jmax ((int) a.getY() + 4, (int) a.getBottom() - badge.getHeight() - 4), (int) top);
-        badge.setTopLeftPosition (x, y);
-        badge.setVisible (true);
-    }
-    else
-    {
-        badge.setVisible (false);
-    }
+    badge.setInfo (what, db);
+    badge.setVisible (show);
 }
 
 //==============================================================================
@@ -521,62 +627,79 @@ void WaveformView::updateBadge()
 //==============================================================================
 void WaveformView::paint (juce::Graphics& g)
 {
+    const auto area = waveArea();
     paintRuler (g, getLocalBounds().withHeight (rulerHeight));
 
-    const auto area = waveArea();
-    g.setColour (Theme::wave);
+    g.setColour (Theme::waveBg);
     g.fillRect (area);
+    paintGrid (g, area);
 
-    paintSelection (g, area);
-    paintWave (g, area);
-    if (tool == Tool::blob)
-        paintBlobs (g, area);
-    if (tool == Tool::envelope || ! proc.getEdits().envelope.empty())
-        paintEnvelope (g, area);
-
-    // selection edges + handles on top of the waveform
+    // range selection
     if (hasSelection())
     {
         const auto x0 = posToX ((double) selA), x1 = posToX ((double) selB);
-        g.setColour (juce::Colours::white);
-        g.fillRect (juce::Rectangle<float> (x0 - 1.0f, (float) area.getY(), 2.0f, (float) area.getHeight()));
-        g.fillRect (juce::Rectangle<float> (x1 - 1.0f, (float) area.getY(), 2.0f, (float) area.getHeight()));
-        for (auto x : { x0, x1 })
-            for (auto y : { (float) area.getY() + 4.0f, (float) area.getBottom() - 22.0f })
+        g.setColour (juce::Colours::white.withAlpha (0.08f));
+        g.fillRect (juce::Rectangle<float> (x0, (float) area.getY(), x1 - x0, (float) area.getHeight()));
+    }
+
+    // hovered blob
+    if (tool == Tool::blob && hoverPos >= 0 && drag == Drag::none)
+        if (auto* sg = segmentAt (hoverPos))
+        {
+            const auto x0 = posToX ((double) sg->start), x1 = posToX ((double) sg->end);
+            juce::Rectangle<float> r (x0, (float) area.getY(), x1 - x0, (float) area.getHeight());
+            g.setColour (juce::Colours::white.withAlpha (0.07f));
+            g.fillRect (r);
+            g.setColour (juce::Colours::white.withAlpha (0.45f));
+            g.drawRect (r, 1.2f);
+        }
+
+    {
+        juce::Graphics::ScopedSaveState ss (g);
+        g.reduceClipRegion (area);
+        paintWave (g, area);
+        paintThreshold (g, area);
+        if (tool == Tool::blob || tool == Tool::peak || tool == Tool::select)
+            paintSpots (g, area);
+        if (tool == Tool::envelope || ! proc.getEdits().envelope.empty())
+            paintEnvelope (g, area);
+
+        if (hasSelection())
+        {
+            const auto x0 = posToX ((double) selA), x1 = posToX ((double) selB);
+            g.setColour (juce::Colours::white.withAlpha (0.7f));
+            g.fillRect (juce::Rectangle<float> (x0 - 0.75f, (float) area.getY(), 1.5f, (float) area.getHeight()));
+            g.fillRect (juce::Rectangle<float> (x1 - 0.75f, (float) area.getY(), 1.5f, (float) area.getHeight()));
+            for (auto x : { x0, x1 })
             {
-                juce::Rectangle<float> h (x - 7.0f, y, 14.0f, 18.0f);
+                juce::Rectangle<float> h (x - 6.0f, (float) area.getY() + 4.0f, 12.0f, 16.0f);
                 g.setColour (juce::Colours::white);
                 g.fillRoundedRectangle (h, 3.0f);
-                g.setColour (juce::Colour (0xff555555));
-                g.drawRoundedRectangle (h, 3.0f, 1.0f);
-                g.drawLine (x - 2.0f, y + 5.0f, x - 2.0f, y + 13.0f, 1.2f);
-                g.drawLine (x + 2.0f, y + 5.0f, x + 2.0f, y + 13.0f, 1.2f);
             }
-    }
+        }
 
-    // play position
-    const auto pp = proc.getPlayPosition();
-    const auto px = posToX ((double) pp);
-    if (px >= 0.0f && px < (float) getWidth() && (proc.isHostPlaying() || proc.isAuditioning()))
-    {
-        g.setColour (juce::Colours::white);
-        g.fillRect (juce::Rectangle<float> (px, (float) area.getY(), 1.5f, (float) area.getHeight()));
-    }
+        const auto pp = proc.getPlayPosition();
+        const auto px = posToX ((double) pp);
+        if (proc.isHostPlaying() || proc.isAuditioning())
+        {
+            g.setColour (juce::Colours::white);
+            g.fillRect (juce::Rectangle<float> (px, (float) area.getY(), 1.5f, (float) area.getHeight()));
+        }
 
-    // cursor (where Play starts when nothing is selected)
-    const auto cx = posToX ((double) cursor);
-    if (cx >= 0.0f && cx < (float) getWidth())
-    {
-        g.setColour (juce::Colours::black.withAlpha (0.45f));
+        const auto cx = posToX ((double) cursor);
+        g.setColour (juce::Colours::white.withAlpha (0.3f));
         g.fillRect (juce::Rectangle<float> (cx, (float) area.getY(), 1.0f, (float) area.getHeight()));
     }
 
+    paintScale (g, getLocalBounds().withTrimmedTop (rulerHeight).removeFromLeft (scaleWidth), true);
+    paintScale (g, getLocalBounds().withTrimmedTop (rulerHeight).removeFromRight (scaleWidth), false);
+
     if (! proc.getCapture().hasData())
     {
-        g.setColour (Theme::ink.withAlpha (0.7f));
-        g.setFont (juce::FontOptions (20.0f));
+        g.setColour (Theme::textDim);
+        g.setFont (juce::FontOptions (19.0f));
         g.drawFittedText (proc.isCapturing() ? "Recording... press play in Ableton"
-                                             : "Press Record, then play your song in Ableton to capture the track",
+                                             : "Press Rec, then play your song in Ableton to capture the track",
                           area.reduced (40), juce::Justification::centred, 2);
     }
 }
@@ -585,6 +708,17 @@ void WaveformView::paintRuler (juce::Graphics& g, juce::Rectangle<int> r)
 {
     g.setColour (Theme::bar);
     g.fillRect (r);
+    g.setColour (juce::Colours::black);
+    g.fillRect (r.removeFromBottom (1));
+
+    g.setColour (juce::Colour (0xff8a919c));
+    g.setFont (juce::FontOptions (11.0f));
+    g.drawText ("dBFS", r.withWidth (scaleWidth), juce::Justification::centred);
+    g.drawText ("dBFS", r.withX (r.getRight() - scaleWidth).withWidth (scaleWidth), juce::Justification::centred);
+
+    const auto area = waveArea();
+    juce::Graphics::ScopedSaveState ss (g);
+    g.reduceClipRegion (r.withX (area.getX()).withWidth (area.getWidth()));
 
     const auto sr = sampleRate();
     const auto secondsPerPixel = spp / sr;
@@ -595,14 +729,14 @@ void WaveformView::paintRuler (juce::Graphics& g, juce::Rectangle<int> r)
     const auto minor = major / 10.0;
 
     const auto t0 = viewStart / sr;
-    const auto t1 = (viewStart + spp * r.getWidth()) / sr;
+    const auto t1 = getViewEnd() / sr;
 
-    g.setFont (juce::FontOptions (14.0f));
+    g.setFont (juce::FontOptions (13.0f));
     for (auto t = std::floor (t0 / minor) * minor; t <= t1; t += minor)
     {
         const auto x = posToX (t * sr);
         const bool isMajor = std::abs (std::remainder (t, major)) < minor * 0.5;
-        g.setColour (juce::Colour (0xff8a919c));
+        g.setColour (juce::Colour (isMajor ? 0xff8a919c : 0xff4a5260));
         g.fillRect (juce::Rectangle<float> (x, (float) r.getBottom() - (isMajor ? 12.0f : 6.0f), 1.0f, isMajor ? 12.0f : 6.0f));
 
         if (isMajor && t >= 0.0)
@@ -614,19 +748,72 @@ void WaveformView::paintRuler (juce::Graphics& g, juce::Rectangle<int> r)
             const auto secs = std::round ((totalSec - mins * 60.0) * scale) / scale;
             auto secStr = juce::String (secs, decimals);
             if (secs < 10.0) secStr = "0" + secStr;
-            g.setColour (juce::Colour (0xffd7dbe0));
-            g.drawText (juce::String (mins) + ":" + secStr, (int) x - 50, r.getY() + 4, 100, 20, juce::Justification::centred);
+            g.setColour (juce::Colour (0xffc9ced6));
+            g.drawText (juce::String (mins) + ":" + secStr, (int) x + 4, r.getY() + 3, 90, 18, juce::Justification::centredLeft);
         }
     }
 }
 
-void WaveformView::paintSelection (juce::Graphics& g, juce::Rectangle<int> area)
+static const float scaleDbs[] = { 0.0f, -1.0f, -3.0f, -6.0f, -9.0f, -12.0f, -18.0f, -24.0f, -30.0f, -40.0f, -50.0f };
+
+void WaveformView::paintGrid (juce::Graphics& g, juce::Rectangle<int> area)
 {
-    if (! hasSelection())
-        return;
-    const auto x0 = posToX ((double) selA), x1 = posToX ((double) selB);
-    g.setColour (Theme::waveSel);
-    g.fillRect (juce::Rectangle<float> (x0, (float) area.getY(), x1 - x0, (float) area.getHeight()));
+    g.setColour (Theme::grid);
+    float lastY = -100.0f;
+    for (auto db : scaleDbs)
+    {
+        const auto y = ampToY (juce::Decibels::decibelsToGain (db), true);
+        if (y < area.getY() || y - lastY < 22.0f || area.getCentreY() - y < 24.0f) continue;
+        lastY = y;
+        g.fillRect ((float) area.getX(), y, (float) area.getWidth(), 1.0f);
+        g.fillRect ((float) area.getX(), ampToY (juce::Decibels::decibelsToGain (db), false), (float) area.getWidth(), 1.0f);
+    }
+    g.setColour (juce::Colour (0xff1c2636));
+    g.fillRect ((float) area.getX(), (float) area.getCentreY(), (float) area.getWidth(), 1.0f);
+}
+
+void WaveformView::paintScale (juce::Graphics& g, juce::Rectangle<int> r, bool left)
+{
+    g.setColour (Theme::scaleBg);
+    g.fillRect (r);
+
+    const auto thrDb = proc.getThresholdDb();
+    const auto minus = juce::String (juce::CharPointer_UTF8 ("\xe2\x88\x92"));
+    auto label = [&] (float db) { return db == 0.0f ? juce::String ("0") : minus + juce::String ((int) -db); };
+
+    g.setFont (juce::FontOptions (12.5f));
+    float lastY = -100.0f;
+    for (auto db : scaleDbs)
+    {
+        const auto yUp = ampToY (juce::Decibels::decibelsToGain (db), true);
+        if (yUp < r.getY() + 4 || yUp - lastY < 22.0f || waveArea().getCentreY() - yUp < 24.0f) continue;
+        if (std::abs (db - thrDb) < 0.01f) continue;   // the threshold label goes there instead
+        lastY = yUp;
+        for (auto y : { yUp, ampToY (juce::Decibels::decibelsToGain (db), false) })
+        {
+            g.setColour (Theme::scaleText);
+            const auto tickX = left ? (float) r.getRight() - 7.0f : (float) r.getX();
+            g.fillRect (tickX, y - 0.5f, 7.0f, 1.2f);
+            auto tr = juce::Rectangle<int> (r.getX() + 4, (int) y - 9, r.getWidth() - 14, 18);
+            if (! left) tr = tr.withX (r.getX() + 10);
+            g.drawText (label (db), tr, left ? juce::Justification::centredRight : juce::Justification::centredLeft);
+        }
+    }
+    g.setColour (juce::Colour (0xff6b7a8f));
+    g.drawText (juce::String (juce::CharPointer_UTF8 ("\xe2\x88\x92\xe2\x88\x9e")), r.withY ((int) waveArea().getCentreY() - 9).withHeight (18).reduced (8, 0),
+                left ? juce::Justification::centredRight : juce::Justification::centredLeft);
+
+    // threshold handles (drag them up / down)
+    for (auto upper : { true, false })
+    {
+        const auto y = ampToY (thresholdGain(), upper);
+        juce::Rectangle<float> h ((float) r.getX() + 3.0f, y - 10.0f, (float) r.getWidth() - 6.0f, 20.0f);
+        g.setColour (Theme::thresh);
+        g.fillRoundedRectangle (h, 5.0f);
+        g.setColour (juce::Colour (0xff14161a));
+        g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
+        g.drawText (label (std::round (thrDb)), h, juce::Justification::centred);
+    }
 }
 
 void WaveformView::paintWave (juce::Graphics& g, juce::Rectangle<int> area)
@@ -637,93 +824,160 @@ void WaveformView::paintWave (juce::Graphics& g, juce::Rectangle<int> area)
 
     const auto& s = proc.getEdits();
     const auto sr = sampleRate();
-    const auto mid = (float) area.getCentreY();
-    const auto halfH = area.getHeight() * 0.46f * vZoom;
-    const auto clipTop = (float) area.getY(), clipBottom = (float) area.getBottom();
-
-    // which columns belong to a selected blob (drawn light)
-    std::vector<std::pair<int64_t, int64_t>> lightRegions;
-    if (tool == Tool::blob || tool == Tool::select)
-        for (auto i : selectedBlobIndices())
-            lightRegions.push_back ({ s.blobs[(size_t) i].start, s.blobs[(size_t) i].end });
-
+    const auto scale = juce::jmax (1.0f, g.getInternalContext().getPhysicalPixelScaleFactor());
+    const auto step = 1.0f / scale;                      // draw at the screen's real resolution
     const auto wStart = cap.getWrittenStart(), wEnd = cap.getWrittenEnd();
 
-    for (int x = 0; x < area.getWidth(); ++x)
+    juce::Path edited, original;
+    std::vector<juce::Point<float>> eTop, eBot, oTop, oBot;
+    bool anyChange = false;
+
+    auto flush = [&]
     {
-        const auto s0 = (int64_t) std::floor (xToPos ((float) x));
-        const auto s1 = (int64_t) std::floor (xToPos ((float) x + 1.0f));
-        if (s1 < wStart || s0 >= wEnd)
-            continue;
+        if (eTop.size() > 1)
+        {
+            edited.startNewSubPath (eTop.front());
+            for (size_t i = 1; i < eTop.size(); ++i) edited.lineTo (eTop[i]);
+            for (auto it = eBot.rbegin(); it != eBot.rend(); ++it) edited.lineTo (*it);
+            edited.closeSubPath();
+            original.startNewSubPath (oTop.front());
+            for (size_t i = 1; i < oTop.size(); ++i) original.lineTo (oTop[i]);
+            for (auto it = oBot.rbegin(); it != oBot.rend(); ++it) original.lineTo (*it);
+            original.closeSubPath();
+        }
+        eTop.clear(); eBot.clear(); oTop.clear(); oBot.clear();
+    };
+
+    for (float x = (float) area.getX(); x < (float) area.getRight(); x += step)
+    {
+        const auto s0 = (int64_t) std::floor (xToPos (x));
+        const auto s1 = juce::jmax (s0 + 1, (int64_t) std::floor (xToPos (x + step)));
+        if (s1 < wStart || s0 >= wEnd) { flush(); continue; }
 
         float lo, hi;
-        peaks.getRange (cap, s0, juce::jmax (s1, s0 + 1), lo, hi);
-        const auto centre = (s0 + s1) / 2;
-        const auto gain = juce::Decibels::decibelsToGain (EditOps::totalDbAt (s, centre, sr), -120.0f);
+        peaks.getRange (cap, s0, s1, lo, hi);
+        const auto gain = juce::Decibels::decibelsToGain (EditOps::totalDbAt (s, (s0 + s1) / 2, sr), -120.0f);
+        if (std::abs (gain - 1.0f) > 0.006f) anyChange = true;
 
-        auto yTop = [&] (float v) { return juce::jlimit (clipTop, clipBottom, mid - v * halfH); };
+        eTop.push_back ({ x, ampToY (hi * gain, true) });
+        eBot.push_back ({ x, ampToY (-lo * gain, false) });
+        oTop.push_back ({ x, ampToY (hi, true) });
+        oBot.push_back ({ x, ampToY (-lo, false) });
+    }
+    flush();
 
-        const bool changed = std::abs (gain - 1.0f) > 0.006f;
-        if (changed)
-        {
-            g.setColour (Theme::ink.withAlpha (0.18f));
-            g.drawVerticalLine (x, yTop (hi), juce::jmax (yTop (hi) + 1.0f, yTop (lo)));
-        }
+    if (anyChange)
+    {
+        g.setColour (Theme::wave.withAlpha (0.28f));
+        g.fillPath (original);
+    }
 
-        bool light = false;
-        for (auto& lr : lightRegions)
-            if (centre >= lr.first && centre < lr.second) { light = true; break; }
+    g.setColour (Theme::wave);
+    g.fillPath (edited);
 
-        g.setColour (light ? Theme::blobSel : Theme::ink);
-        const auto top = yTop (hi * gain), bottom = yTop (lo * gain);
-        g.drawVerticalLine (x, top, juce::jmax (top + 1.0f, bottom));
+    // everything over the threshold, in orange
+    const auto ty = ampToY (thresholdGain(), true), by = ampToY (thresholdGain(), false);
+    {
+        juce::Graphics::ScopedSaveState ss (g);
+        juce::RectangleList<int> over;
+        over.add (area.withBottom ((int) std::floor (ty)));
+        over.add (area.withTop ((int) std::ceil (by)));
+        g.reduceClipRegion (over);
+        g.setColour (Theme::over);
+        g.fillPath (edited);
     }
 }
 
-void WaveformView::paintBlobs (juce::Graphics& g, juce::Rectangle<int> area)
+void WaveformView::paintThreshold (juce::Graphics& g, juce::Rectangle<int> area)
 {
-    const auto& bl = proc.getEdits().blobs;
-    const auto mid = (float) area.getCentreY();
-    const auto t0 = (int64_t) viewStart, t1 = (int64_t) getViewEnd();
-
-    auto it = std::upper_bound (bl.begin(), bl.end(), t0, [] (int64_t p, const Blob& b) { return p < b.start; });
-    if (it != bl.begin()) --it;
-
-    float lastX = -1000.0f;
-    for (; it != bl.end() && it->start < t1; ++it)
+    const auto alpha = tool == Tool::peak ? 0.95f : 0.5f;
+    float dashes[] = { 7.0f, 5.0f };
+    for (auto upper : { true, false })
     {
-        const auto x0 = posToX ((double) it->start);
-        const auto x1 = posToX ((double) it->end);
+        const auto y = ampToY (thresholdGain(), upper);
+        g.setColour (Theme::thresh.withAlpha (alpha));
+        g.drawDashedLine (juce::Line<float> ((float) area.getX(), y, (float) area.getRight(), y), dashes, 2, 1.5f);
+    }
 
-        // boundary ticks so the segmentation is visible
-        if (x0 - lastX > 3.0f)
+    if (tool == Tool::peak)
+    {
+        refreshVisiblePeaks();
+        g.setColour (Theme::over);
+        for (auto& p : visiblePeaks)
         {
-            g.setColour (Theme::ink.withAlpha (0.55f));
-            g.fillRect (juce::Rectangle<float> (x0, mid - 10.0f, 1.0f, 20.0f));
+            const auto x = posToX ((double) p.at);
+            const auto y = ampToY (p.level, true) - 6.0f;
+            juce::Path tri;
+            tri.addTriangle (x - 5.0f, juce::jmax ((float) area.getY() + 2.0f, y - 8.0f), x + 5.0f,
+                             juce::jmax ((float) area.getY() + 2.0f, y - 8.0f), x, juce::jmax ((float) area.getY() + 9.0f, y - 1.0f));
+            g.fillPath (tri);
         }
-        lastX = x0;
+    }
+}
 
-        // small dB label on blobs that have a gain change (when there is room)
-        if (it->db != 0.0f && x1 - x0 > 46.0f)
+void WaveformView::paintSpots (juce::Graphics& g, juce::Rectangle<int> area)
+{
+    const auto& sp = proc.getEdits().spots;
+    const auto t0 = (int64_t) viewStart, t1 = (int64_t) getViewEnd();
+    auto selIdx = selectedSpotIndices();
+    float dashes[] = { 6.0f, 4.0f };
+
+    for (int i = 0; i < (int) sp.size(); ++i)
+    {
+        const auto& s = sp[(size_t) i];
+        if (s.end < t0 || s.start > t1) continue;
+        const bool selected = std::binary_search (selIdx.begin(), selIdx.end(), i);
+        const auto x0 = posToX ((double) s.start), x1 = posToX ((double) s.end);
+        const auto inset = s.kind == SpotEdit::peak ? 14.0f : 6.0f;
+        juce::Rectangle<float> r (x0, (float) area.getY() + inset, juce::jmax (2.0f, x1 - x0), (float) area.getHeight() - inset * 2.0f);
+
+        juce::Path outline;
+        outline.addRoundedRectangle (r, 6.0f);
+        if (selected)
         {
-            g.setColour (Theme::ink);
+            g.setColour (juce::Colours::white.withAlpha (0.06f));
+            g.fillRoundedRectangle (r, 6.0f);
+            g.setColour (juce::Colours::white);
+            g.strokePath (outline, juce::PathStrokeType (1.6f));
+        }
+        else
+        {
+            juce::Path dashed;
+            juce::PathStrokeType (1.6f).createDashedStroke (dashed, outline, dashes, 2);
+            g.setColour ((s.kind == SpotEdit::peak ? Theme::thresh : Theme::spot).withAlpha (0.85f));
+            g.fillPath (dashed);
+        }
+
+        // label with a small lock: this edit stays where it is when you zoom
+        const auto visibleW = juce::jmin (r.getRight(), (float) area.getRight()) - juce::jmax (r.getX(), (float) area.getX());
+        if (visibleW > 84.0f)
+        {
+            // bottom-left of the visible part (the top corners hold the gain badge and the peak bar)
+            juce::Rectangle<float> tag (juce::jmax (r.getX(), (float) area.getX()) + 6.0f, r.getBottom() - 26.0f, 74.0f, 20.0f);
+            g.setColour (s.kind == SpotEdit::peak ? Theme::thresh : Theme::spotFill);
+            g.fillRoundedRectangle (tag, 5.0f);
+            const auto fg = s.kind == SpotEdit::peak ? juce::Colour (0xff14161a) : juce::Colours::white;
+            g.setColour (fg);
+            juce::Rectangle<float> body (tag.getX() + 7.0f, tag.getY() + 9.0f, 9.0f, 7.0f);
+            g.fillRoundedRectangle (body, 1.5f);
+            juce::Path shackle;
+            shackle.addCentredArc (body.getCentreX(), body.getY(), 3.0f, 3.5f, 0.0f, -juce::MathConstants<float>::halfPi,
+                                   juce::MathConstants<float>::halfPi, true);
+            g.strokePath (shackle, juce::PathStrokeType (1.5f));
             g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
-            g.drawText ((it->db > 0 ? "+" : "") + juce::String (it->db, 1), (int) x0, area.getBottom() - 26, (int) (x1 - x0), 18,
-                        juce::Justification::centred);
+            auto t = dbText (s.db, 1);
+            g.drawText (t.upToFirstOccurrenceOf (" dB", false, false), tag.withTrimmedLeft (20.0f), juce::Justification::centredLeft);
         }
 
-        // handles on selected blobs
-        if (selectedBlobStarts.count (it->start) > 0)
-        {
+        if (selected)
             for (auto x : { x0, x1 })
             {
-                juce::Rectangle<float> h (x - 6.0f, mid - 6.0f, 12.0f, 12.0f);
+                juce::Rectangle<float> h (x - 5.0f, (float) area.getCentreY() - 5.0f, 10.0f, 10.0f);
                 g.setColour (juce::Colours::white);
                 g.fillRect (h);
-                g.setColour (Theme::env);
+                g.setColour (Theme::spotFill);
                 g.drawRect (h, 2.0f);
             }
-        }
     }
 }
 
@@ -731,44 +985,39 @@ void WaveformView::paintEnvelope (juce::Graphics& g, juce::Rectangle<int> area)
 {
     const auto& e = proc.getEdits().envelope;
     juce::Path line;
-    const auto w = (float) getWidth();
+    const auto x0 = (float) area.getX(), x1 = (float) area.getRight();
 
     if (e.empty())
     {
-        line.startNewSubPath (0.0f, dbToY (0.0f));
-        line.lineTo (w, dbToY (0.0f));
+        line.startNewSubPath (x0, dbToY (0.0f));
+        line.lineTo (x1, dbToY (0.0f));
     }
     else
     {
-        line.startNewSubPath (0.0f, dbToY (EditOps::envelopeDbAt (proc.getEdits(), (int64_t) viewStart)));
+        line.startNewSubPath (x0, dbToY (EditOps::envelopeDbAt (proc.getEdits(), (int64_t) viewStart)));
         for (auto& p : e)
         {
             const auto x = posToX ((double) p.pos);
-            if (x < -2000.0f || x > w + 2000.0f) continue;
+            if (x < x0 - 2000.0f || x > x1 + 2000.0f) continue;
             line.lineTo (x, dbToY (p.db));
         }
-        line.lineTo (w, dbToY (EditOps::envelopeDbAt (proc.getEdits(), (int64_t) getViewEnd())));
+        line.lineTo (x1, dbToY (EditOps::envelopeDbAt (proc.getEdits(), (int64_t) getViewEnd())));
     }
 
-    g.saveState();
-    g.reduceClipRegion (area);
-    g.setColour (Theme::env.withAlpha (tool == Tool::envelope ? 1.0f : 0.55f));
-    g.strokePath (line, juce::PathStrokeType (2.2f));
+    g.setColour (Theme::envLine.withAlpha (tool == Tool::envelope ? 0.95f : 0.45f));
+    g.strokePath (line, juce::PathStrokeType (2.0f));
 
     if (tool == Tool::envelope)
-    {
         for (int i = 0; i < (int) e.size(); ++i)
         {
             const auto x = posToX ((double) e[(size_t) i].pos);
-            if (x < -10.0f || x > w + 10.0f) continue;
+            if (x < x0 - 10.0f || x > x1 + 10.0f) continue;
             juce::Rectangle<float> h (x - 5.0f, dbToY (e[(size_t) i].db) - 5.0f, 10.0f, 10.0f);
-            g.setColour (i == selectedPoint ? Theme::env : juce::Colours::white);
+            g.setColour (i == selectedPoint ? Theme::wave : Theme::waveBg);
             g.fillRect (h);
-            g.setColour (Theme::env);
+            g.setColour (Theme::envLine);
             g.drawRect (h, 2.0f);
         }
-    }
-    g.restoreState();
 }
 
 //==============================================================================
@@ -778,38 +1027,56 @@ void WaveformView::mouseMove (const juce::MouseEvent& e)
 {
     auto cursorType = juce::MouseCursor::NormalCursor;
     const auto x = e.position.x;
+    const auto area = waveArea();
 
     if (e.position.y < rulerHeight)
         cursorType = juce::MouseCursor::PointingHandCursor;
-    else if (tool == Tool::range && hasSelection())
-    {
-        const auto x0 = posToX ((double) selA), x1 = posToX ((double) selB);
-        if (std::abs (x - x0) < 7.0f || std::abs (x - x1) < 7.0f)
-            cursorType = juce::MouseCursor::LeftRightResizeCursor;
-        else if (x > x0 && x < x1)
-            cursorType = juce::MouseCursor::UpDownResizeCursor;
-        else
-            cursorType = juce::MouseCursor::IBeamCursor;
-    }
+    else if (x < area.getX() || x >= area.getRight())
+        cursorType = juce::MouseCursor::UpDownResizeCursor;     // threshold
     else if (tool == Tool::range)
+    {
         cursorType = juce::MouseCursor::IBeamCursor;
+        if (hasSelection())
+        {
+            const auto x0 = posToX ((double) selA), x1 = posToX ((double) selB);
+            if (std::abs (x - x0) < 7.0f || std::abs (x - x1) < 7.0f) cursorType = juce::MouseCursor::LeftRightResizeCursor;
+            else if (x > x0 && x < x1) cursorType = juce::MouseCursor::UpDownResizeCursor;
+        }
+    }
     else if (tool == Tool::envelope)
         cursorType = envPointNear (e.position) >= 0 ? juce::MouseCursor::DraggingHandCursor : juce::MouseCursor::CrosshairCursor;
-    else if (tool == Tool::blob)
+    else if (tool == Tool::blob || tool == Tool::peak || tool == Tool::select)
     {
         cursorType = juce::MouseCursor::UpDownResizeCursor;
-        for (auto i : selectedBlobIndices())
+        for (auto i : selectedSpotIndices())
         {
-            const auto& b = proc.getEdits().blobs[(size_t) i];
-            if (std::abs (x - posToX ((double) b.start)) < 7.0f || std::abs (x - posToX ((double) b.end)) < 7.0f)
+            const auto& b = proc.getEdits().spots[(size_t) i];
+            if (std::abs (x - posToX ((double) b.start)) < 6.0f || std::abs (x - posToX ((double) b.end)) < 6.0f)
                 cursorType = juce::MouseCursor::LeftRightResizeCursor;
         }
     }
     setMouseCursor (cursorType);
+
+    if (tool == Tool::blob)
+    {
+        refreshSegments();
+        const auto newHover = (x >= area.getX() && x < area.getRight() && e.position.y >= rulerHeight) ? (int64_t) xToPos (x) : -1;
+        auto* before = hoverPos >= 0 ? segmentAt (hoverPos) : nullptr;
+        auto* after = newHover >= 0 ? segmentAt (newHover) : nullptr;
+        hoverPos = newHover;
+        if (before != after)
+            repaint();
+    }
+}
+
+void WaveformView::mouseExit (const juce::MouseEvent&)
+{
+    if (hoverPos >= 0) { hoverPos = -1; repaint(); }
 }
 
 void WaveformView::mouseDown (const juce::MouseEvent& e)
 {
+    grabFocusForKeys();
     dragMoved = false;
     lastDragY = e.position.y;
     dragDbAccum = 0.0f;
@@ -821,10 +1088,10 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
         return;
     }
 
-    const auto pos = (int64_t) xToPos (e.position.x);
+    const auto area = waveArea();
     const auto x = e.position.x;
+    const auto pos = (int64_t) xToPos (x);
 
-    // Ruler: set the cursor (where Play starts)
     if (e.position.y < rulerHeight)
     {
         cursor = juce::jmax ((int64_t) 0, pos);
@@ -833,12 +1100,42 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
         return;
     }
 
-    auto& edits = proc.getEdits();
+    if (x < area.getX() || x >= area.getRight())
+    {
+        drag = Drag::threshold;
+        mouseDrag (e);
+        return;
+    }
+
+    const auto& edits = proc.getEdits();
+
+    // edge handles of selected spots (all spot tools)
+    if (tool == Tool::blob || tool == Tool::peak || tool == Tool::select)
+        for (auto i : selectedSpotIndices())
+        {
+            const auto& b = edits.spots[(size_t) i];
+            if (std::abs (x - posToX ((double) b.start)) < 6.0f || std::abs (x - posToX ((double) b.end)) < 6.0f)
+            {
+                drag = std::abs (x - posToX ((double) b.start)) < 6.0f ? Drag::spotStart : Drag::spotEnd;
+                selectedSpots = { { b.start, b.end, b.kind } };
+                proc.beginDrag();
+                return;
+            }
+        }
+
+    auto startSpotDrag = [this]
+    {
+        dragStartSpotDb.clear();
+        for (auto i : selectedSpotIndices())
+            dragStartSpotDb.push_back (proc.getEdits().spots[(size_t) i].db);
+        drag = Drag::spotGain;
+    };
 
     switch (tool)
     {
         case Tool::range:
         {
+            selectedSpots.clear();
             if (hasSelection())
             {
                 const auto x0 = posToX ((double) selA), x1 = posToX ((double) selB);
@@ -863,7 +1160,6 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
             dragAnchor = pos;
             selA = selB = pos;
             activeRange = -1;
-            selectedBlobStarts.clear();
             cursor = juce::jmax ((int64_t) 0, pos);
             break;
         }
@@ -878,7 +1174,6 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
                 const auto db = yToDb (e.position.y);
                 if (s.envelope.empty())
                 {
-                    // first point: add 0 dB anchors around it so only this spot changes
                     const auto anchor = (int64_t) (sampleRate() * 0.15);
                     s.envelope.push_back ({ pos - anchor, 0.0f });
                     s.envelope.push_back ({ pos + anchor, 0.0f });
@@ -895,75 +1190,102 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
         }
 
         case Tool::blob:
-        case Tool::select:
         {
-            // blob edge handles
-            if (tool == Tool::blob)
-            {
-                for (auto i : selectedBlobIndices())
-                {
-                    const auto& b = edits.blobs[(size_t) i];
-                    if (std::abs (x - posToX ((double) b.start)) < 7.0f) { drag = Drag::blobStart; dragAnchor = b.start; proc.beginDrag(); return; }
-                    if (std::abs (x - posToX ((double) b.end)) < 7.0f)   { drag = Drag::blobEnd;   dragAnchor = b.start; proc.beginDrag(); return; }
-                }
-            }
-
-            const auto bi = blobIndexAt (pos);
-            if (tool == Tool::select && bi < 0)
-            {
-                const auto ri = rangeEditAt (pos);
-                selectedBlobStarts.clear();
-                if (ri >= 0)
-                {
-                    activeRange = ri;
-                    selA = edits.ranges[(size_t) ri].start;
-                    selB = edits.ranges[(size_t) ri].end;
-                    dragStartDb = edits.ranges[(size_t) ri].db;
-                    drag = Drag::rangeGain;
-                    proc.beginDrag();
-                }
-                else
-                {
-                    selA = selB = 0;
-                    activeRange = -1;
-                }
-                break;
-            }
-
-            if (bi < 0)
-            {
-                if (! e.mods.isShiftDown())
-                    selectedBlobStarts.clear();
-                selA = selB = 0;
-                activeRange = -1;
-                break;
-            }
-
-            const auto start = edits.blobs[(size_t) bi].start;
-            if (e.mods.isShiftDown() || e.mods.isCommandDown())
-            {
-                if (selectedBlobStarts.count (start) > 0) selectedBlobStarts.erase (start);
-                else selectedBlobStarts.insert (start);
-            }
-            else if (selectedBlobStarts.count (start) == 0)
-            {
-                selectedBlobStarts = { start };
-            }
+            refreshSegments();
             selA = selB = 0;
             activeRange = -1;
-
-            dragStartBlobDb.clear();
-            for (auto i : selectedBlobIndices())
-                dragStartBlobDb.push_back (edits.blobs[(size_t) i].db);
-            drag = Drag::blobGain;
+            auto* sg = segmentAt (pos);
+            if (sg == nullptr)
+            {
+                if (! e.mods.isShiftDown()) selectedSpots.clear();
+                break;
+            }
             proc.beginDrag();
+            auto s = edits;
+            const auto i = EditOps::ensureSpot (s, sg->start, sg->end, SpotEdit::blob);
+            proc.setEdits (s, false);
+            selectSpot (proc.getEdits().spots[(size_t) i], e.mods.isShiftDown() || e.mods.isCommandDown());
+            startSpotDrag();
+            break;
+        }
+
+        case Tool::peak:
+        {
+            selA = selB = 0;
+            activeRange = -1;
+            refreshVisiblePeaks();
+            if (auto* pk = peakNear (pos))
+            {
+                int64_t a, b;
+                Analysis::peakRegion (*pk, sampleRate(), a, b);
+                proc.beginDrag();
+                auto s = edits;
+                const auto i = EditOps::ensureSpot (s, a, b, SpotEdit::peak);
+                proc.setEdits (s, false);
+                selectSpot (proc.getEdits().spots[(size_t) i], e.mods.isShiftDown() || e.mods.isCommandDown());
+                startSpotDrag();
+                break;
+            }
+            // not on a peak: pick an existing peak spot under the mouse, if any
+            for (auto& sp : edits.spots)
+                if (sp.kind == SpotEdit::peak && pos >= sp.start && pos < sp.end)
+                {
+                    selectSpot (sp, e.mods.isShiftDown());
+                    proc.beginDrag();
+                    startSpotDrag();
+                    break;
+                }
+            if (drag == Drag::none && ! e.mods.isShiftDown())
+                selectedSpots.clear();
+            break;
+        }
+
+        case Tool::select:
+        default:
+        {
+            // all spots under the mouse, smallest first; clicking again in the same place picks the next one
+            std::vector<const SpotEdit*> under;
+            for (auto& sp : edits.spots)
+                if (pos >= sp.start && pos < sp.end)
+                    under.push_back (&sp);
+            std::sort (under.begin(), under.end(), [] (auto* a, auto* b) { return a->end - a->start < b->end - b->start; });
+
+            clickCycle = (e.position.getDistanceFrom (lastClick) < 4.0f) ? clickCycle + 1 : 0;
+            lastClick = e.position;
+
+            if (! under.empty())
+            {
+                selA = selB = 0;
+                activeRange = -1;
+                selectSpot (*under[(size_t) clickCycle % under.size()], false);
+                selectedSpots = { { under[(size_t) clickCycle % under.size()]->start, under[(size_t) clickCycle % under.size()]->end,
+                                    under[(size_t) clickCycle % under.size()]->kind } };
+                proc.beginDrag();
+                startSpotDrag();
+                break;
+            }
+
+            selectedSpots.clear();
+            const auto ri = rangeEditAt (pos);
+            if (ri >= 0)
+            {
+                activeRange = ri;
+                selA = edits.ranges[(size_t) ri].start;
+                selB = edits.ranges[(size_t) ri].end;
+                dragStartDb = edits.ranges[(size_t) ri].db;
+                drag = Drag::rangeGain;
+                proc.beginDrag();
+            }
+            else
+            {
+                selA = selB = 0;
+                activeRange = -1;
+            }
             break;
         }
     }
 
-    updateBadge();
-    repaint();
-    if (onStateChanged) onStateChanged();
+    changed();
 }
 
 void WaveformView::mouseDrag (const juce::MouseEvent& e)
@@ -986,6 +1308,21 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
             repaint();
             return;
 
+        case Drag::threshold:
+        {
+            const auto a = waveArea().toFloat();
+            const auto half = (a.getHeight() * 0.5f - 10.0f) * vZoom;
+            const auto amp = juce::jlimit (0.01f, 1.0f, std::abs (e.position.y - a.getCentreY()) / half);
+            auto db = juce::Decibels::gainToDecibels (amp);
+            db = e.mods.isAltDown() ? std::round (db * 10.0f) / 10.0f : std::round (db * 2.0f) / 2.0f;
+            proc.setThresholdDb (db);
+            peaksDirty = true;
+            peakCount = -1;
+            repaint();
+            if (onStateChanged) onStateChanged();
+            return;
+        }
+
         case Drag::newSelection:
             selA = juce::jmin (dragAnchor, pos);
             selB = juce::jmax (dragAnchor, pos);
@@ -993,7 +1330,6 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
 
         case Drag::edgeA:
         case Drag::edgeB:
-        {
             if (drag == Drag::edgeA) selA = pos; else selB = pos;
             if (selA > selB) { std::swap (selA, selB); drag = (drag == Drag::edgeA ? Drag::edgeB : Drag::edgeA); }
             if (activeRange >= 0 && activeRange < (int) s.ranges.size())
@@ -1003,7 +1339,6 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
                 proc.setEdits (s, false);
             }
             break;
-        }
 
         case Drag::rangeGain:
             if (activeRange >= 0 && activeRange < (int) s.ranges.size())
@@ -1019,56 +1354,36 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
                 auto& p = s.envelope[(size_t) selectedPoint];
                 const auto lo = selectedPoint > 0 ? s.envelope[(size_t) selectedPoint - 1].pos + 1 : std::numeric_limits<int64_t>::min() / 2;
                 const auto hi = selectedPoint + 1 < (int) s.envelope.size() ? s.envelope[(size_t) selectedPoint + 1].pos - 1 : std::numeric_limits<int64_t>::max() / 2;
-                p.pos = juce::jlimit (lo, hi, pos);
                 if (e.mods.isAltDown())
-                    p.db = juce::jlimit (-36.0f, 12.0f, p.db + dy * 0.01f);   // fine vertical only
+                    p.db = juce::jlimit (-36.0f, 12.0f, p.db + dy * 0.01f);   // fine: vertical only
                 else
+                {
+                    p.pos = juce::jlimit (lo, hi, pos);
                     p.db = yToDb (e.position.y);
+                }
                 proc.setEdits (s, false);
             }
             break;
 
-        case Drag::blobGain:
+        case Drag::spotGain:
         {
-            auto idx = selectedBlobIndices();
-            for (size_t k = 0; k < idx.size() && k < dragStartBlobDb.size(); ++k)
-                s.blobs[(size_t) idx[k]].db = juce::jlimit (-48.0f, 24.0f, dragStartBlobDb[k] + dragDbAccum);
+            auto idx = selectedSpotIndices();
+            for (size_t k = 0; k < idx.size() && k < dragStartSpotDb.size(); ++k)
+                s.spots[(size_t) idx[k]].db = juce::jlimit (-48.0f, 24.0f, dragStartSpotDb[k] + dragDbAccum);
             proc.setEdits (s, false);
             break;
         }
 
-        case Drag::blobStart:
-        case Drag::blobEnd:
+        case Drag::spotStart:
+        case Drag::spotEnd:
         {
-            int bi = -1;
-            for (int i = 0; i < (int) s.blobs.size(); ++i)
-                if (s.blobs[(size_t) i].start == dragAnchor) { bi = i; break; }
-            if (bi < 0) break;
-
-            auto& b = s.blobs[(size_t) bi];
-            if (drag == Drag::blobStart)
-            {
-                const auto lo = bi > 0 ? s.blobs[(size_t) bi - 1].start + minLen : (int64_t) 0;
-                b.start = juce::jlimit (lo, b.end - minLen, pos);
-                if (bi > 0 && s.blobs[(size_t) bi - 1].end > b.start)
-                    s.blobs[(size_t) bi - 1].end = b.start;        // neighbour shrinks
-                selectedBlobStarts.erase (dragAnchor);
-                selectedBlobStarts.insert (b.start);
-                dragAnchor = b.start;
-            }
-            else
-            {
-                const auto hi = bi + 1 < (int) s.blobs.size() ? s.blobs[(size_t) bi + 1].end - minLen : std::numeric_limits<int64_t>::max() / 2;
-                b.end = juce::jlimit (b.start + minLen, hi, pos);
-                if (bi + 1 < (int) s.blobs.size() && s.blobs[(size_t) bi + 1].start < b.end)
-                {
-                    auto& n = s.blobs[(size_t) bi + 1];
-                    const bool wasSel = selectedBlobStarts.count (n.start) > 0;
-                    selectedBlobStarts.erase (n.start);
-                    n.start = b.end;
-                    if (wasSel) selectedBlobStarts.insert (n.start);
-                }
-            }
+            auto idx = selectedSpotIndices();
+            if (idx.empty()) break;
+            auto& b = s.spots[(size_t) idx.front()];
+            if (drag == Drag::spotStart) b.start = juce::jmin (pos, b.end - minLen);
+            else                         b.end = juce::jmax (pos, b.start + minLen);
+            selectedSpots = { { b.start, b.end, b.kind } };
+            EditOps::sortSpots (s);
             proc.setEdits (s, false);
             break;
         }
@@ -1078,9 +1393,7 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
             break;
     }
 
-    updateBadge();
-    repaint();
-    if (onStateChanged) onStateChanged();
+    changed();
 }
 
 void WaveformView::mouseUp (const juce::MouseEvent& e)
@@ -1090,9 +1403,7 @@ void WaveformView::mouseUp (const juce::MouseEvent& e)
         case Drag::newSelection:
             if (! dragMoved || selB - selA < (int64_t) (spp * 3.0))
             {
-                // a click: select the range edit under the mouse, if any
-                const auto pos = (int64_t) xToPos (e.position.x);
-                const auto ri = rangeEditAt (pos);
+                const auto ri = rangeEditAt ((int64_t) xToPos (e.position.x));
                 if (ri >= 0)
                 {
                     activeRange = ri;
@@ -1100,42 +1411,56 @@ void WaveformView::mouseUp (const juce::MouseEvent& e)
                     selB = proc.getEdits().ranges[(size_t) ri].end;
                 }
                 else
-                {
                     selA = selB = 0;
-                }
             }
             break;
         case Drag::edgeA:
-        case Drag::edgeB:    proc.commitDrag ("Resize Range"); break;
+        case Drag::edgeB:     proc.commitDrag ("Resize Range"); break;
         case Drag::rangeGain: proc.commitDrag ("Range Gain"); break;
         case Drag::envPoint:  proc.commitDrag ("Envelope"); break;
-        case Drag::blobGain:  proc.commitDrag ("Blob Gain"); break;
-        case Drag::blobStart:
-        case Drag::blobEnd:   proc.commitDrag ("Resize Blob"); break;
+        case Drag::spotGain:
+        case Drag::spotStart:
+        case Drag::spotEnd:
+        {
+            // a click that changed nothing leaves no empty 0 dB spot behind
+            auto s = proc.getEdits();
+            const auto before = s.spots.size();
+            EditOps::pruneSpots (s);
+            if (s.spots.size() != before)
+                proc.setEdits (s, false);
+            proc.commitDrag (tool == Tool::peak ? "Peak Gain" : "Blob Gain");
+            break;
+        }
         case Drag::ruler:
+        case Drag::threshold:
         case Drag::none:
         default: break;
     }
 
     drag = Drag::none;
-    updateBadge();
-    repaint();
-    if (onStateChanged) onStateChanged();
+    changed();
 }
 
 void WaveformView::mouseDoubleClick (const juce::MouseEvent& e)
 {
+    const auto area = waveArea();
+    if (e.position.x < area.getX() || e.position.x >= area.getRight())
+    {
+        proc.setThresholdDb (-6.0f);   // double-click the scale: back to -6 dB
+        peaksDirty = true;
+        peakCount = -1;
+        changed();
+        return;
+    }
     if (e.position.y < rulerHeight)
         return;
-
-    const auto pos = (int64_t) xToPos (e.position.x);
-    auto s = proc.getEdits();
 
     if (tool == Tool::envelope)
     {
         const auto idx = envPointNear (e.position);
         if (idx >= 0)
         {
+            auto s = proc.getEdits();
             s.envelope.erase (s.envelope.begin() + idx);
             selectedPoint = -1;
             proc.setEdits (s, true, "Delete Envelope Point");
@@ -1143,33 +1468,15 @@ void WaveformView::mouseDoubleClick (const juce::MouseEvent& e)
         return;
     }
 
-    if (tool == Tool::blob)
-    {
-        const auto bi = blobIndexAt (pos);
-        if (bi < 0) return;
-        auto b = s.blobs[(size_t) bi];
-        const auto minLen = (int64_t) (sampleRate() * 0.001);
-        if (pos - b.start < minLen || b.end - pos < minLen)
-            return;
-        s.blobs[(size_t) bi].end = pos;
-        s.blobs.insert (s.blobs.begin() + bi + 1, Blob { pos, b.end, b.db });
-        selectedBlobStarts = { pos };
-        proc.setEdits (s, true, "Split Blob");
-        return;
-    }
-
     if (tool == Tool::range)
     {
-        // double-click selects the blob-sized phrase under the mouse, handy for quick fixes
-        const auto bi = blobIndexAt (pos);
-        if (bi >= 0)
+        refreshSegments();
+        if (auto* sg = segmentAt ((int64_t) xToPos (e.position.x)))
         {
-            selA = s.blobs[(size_t) bi].start;
-            selB = s.blobs[(size_t) bi].end;
+            selA = sg->start;
+            selB = sg->end;
             activeRange = -1;
-            updateBadge();
-            repaint();
-            if (onStateChanged) onStateChanged();
+            changed();
         }
     }
 }
@@ -1187,10 +1494,8 @@ void WaveformView::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseW
         return;
     }
 
-    auto delta = std::abs (w.deltaX) > std::abs (w.deltaY) ? -w.deltaX : -w.deltaY;
-    if (e.mods.isShiftDown() && std::abs (w.deltaX) < 1e-6f)
-        delta = -w.deltaY;
-    scrollTo (viewStart + (double) delta * getWidth() * spp * 0.5);
+    const auto delta = std::abs (w.deltaX) > std::abs (w.deltaY) ? -w.deltaX : -w.deltaY;
+    scrollTo (viewStart + (double) delta * waveArea().getWidth() * spp * 0.5);
 }
 
 void WaveformView::mouseMagnify (const juce::MouseEvent& e, float scaleFactor)
@@ -1213,10 +1518,10 @@ double OverviewStrip::totalLength() const
 
 void OverviewStrip::paint (juce::Graphics& g)
 {
-    auto r = getLocalBounds().toFloat().reduced (10.0f, 8.0f);
-    g.setColour (juce::Colour (0xff121418));
+    auto r = getLocalBounds().toFloat().reduced (10.0f, 7.0f);
+    g.setColour (Theme::waveBg);
     g.fillRoundedRectangle (r, 6.0f);
-    g.setColour (juce::Colour (0xff3a3f47));
+    g.setColour (juce::Colour (0xff262c35));
     g.drawRoundedRectangle (r, 6.0f, 1.0f);
 
     const auto& cap = proc.getCapture();
@@ -1248,9 +1553,8 @@ void OverviewStrip::paint (juce::Graphics& g)
 
 void OverviewStrip::jumpTo (float x)
 {
-    auto r = getLocalBounds().toFloat().reduced (10.0f, 8.0f);
-    const auto total = totalLength();
-    const auto centre = (double) ((x - r.getX()) / r.getWidth()) * total;
+    auto r = getLocalBounds().toFloat().reduced (10.0f, 7.0f);
+    const auto centre = (double) ((x - r.getX()) / r.getWidth()) * totalLength();
     const auto width = view.getViewEnd() - view.getViewStart();
     view.scrollTo (centre - width * 0.5);
     repaint();

@@ -17,6 +17,26 @@ struct EditAction : public juce::UndoableAction
 };
 
 //==============================================================================
+// One virtual MIDI port shared by every Gain Editor in the session.
+static std::shared_ptr<juce::MidiOutput> sharedMidiPort()
+{
+    static std::mutex m;
+    static std::weak_ptr<juce::MidiOutput> weak;
+    const std::lock_guard<std::mutex> lock (m);
+
+    if (auto existing = weak.lock())
+        return existing;
+
+   #if JUCE_MAC || JUCE_LINUX
+    std::shared_ptr<juce::MidiOutput> port (juce::MidiOutput::createNewDevice ("Gain Editor").release());
+    weak = port;
+    return port;
+   #else
+    return {};
+   #endif
+}
+
+//==============================================================================
 GainEditorProcessor::GainEditorProcessor()
     : AudioProcessor (BusesProperties()
                           .withInput ("Input", juce::AudioChannelSet::stereo(), true)
@@ -213,7 +233,6 @@ void GainEditorProcessor::setCapturing (bool shouldCapture)
     else
     {
         capturing = false;
-        redetectBlobs (edits.blobResolution);
     }
     sendChangeMessage();
 }
@@ -228,7 +247,7 @@ void GainEditorProcessor::clearCapture()
     suspendProcessing (false);
 
     auto s = edits;
-    s.blobs.clear();
+    s.spots.clear();
     setEdits (s, true, "Clear Recording");
     sendChangeMessage();
 }
@@ -247,13 +266,40 @@ void GainEditorProcessor::stopAudition()
     auditioning = false;
 }
 
-void GainEditorProcessor::redetectBlobs (float resolution, int64_t a, int64_t b)
+float GainEditorProcessor::getThresholdDb() const
 {
-    auto s = edits;
-    if (b <= a)
-        s.blobResolution = resolution;
-    Analysis::redetect (s, capture, resolution, a, b);
-    setEdits (s, true, "Blob Resolution");
+    return (float) uiState.getProperty ("thresholdDb", -6.0f);
+}
+
+void GainEditorProcessor::setThresholdDb (float db)
+{
+    uiState.setProperty ("thresholdDb", juce::jlimit (-40.0f, 0.0f, db), nullptr);
+    sendChangeMessage();
+}
+
+bool GainEditorProcessor::isAbletonSync() const
+{
+    return (bool) uiState.getProperty ("abletonSync", false);
+}
+
+void GainEditorProcessor::setAbletonSync (bool on)
+{
+    uiState.setProperty ("abletonSync", on, nullptr);
+    if (on && midiOut == nullptr)
+        midiOut = sharedMidiPort();
+    sendChangeMessage();
+}
+
+void GainEditorProcessor::sendTransport (bool play)
+{
+    if (midiOut == nullptr)
+        midiOut = sharedMidiPort();
+    if (midiOut == nullptr)
+        return;
+
+    const int note = play ? 60 : 61;
+    midiOut->sendMessageNow (juce::MidiMessage::noteOn (16, note, (juce::uint8) 127));
+    midiOut->sendMessageNow (juce::MidiMessage::noteOff (16, note));
 }
 
 //==============================================================================
@@ -361,6 +407,9 @@ void GainEditorProcessor::setStateInformation (const void* data, int sizeInBytes
     if (! capture.hasData())
         capture.setSampleRate (currentSampleRate);
     suspendProcessing (false);
+
+    if (isAbletonSync() && midiOut == nullptr)
+        midiOut = sharedMidiPort();
 
     undoManager.clearUndoHistory();
     publishGainMap();

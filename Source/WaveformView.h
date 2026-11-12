@@ -2,7 +2,6 @@
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 #include "Analysis.h"
-#include <set>
 
 //==============================================================================
 /** Min/max of the captured audio per 64 samples, for fast drawing. */
@@ -32,11 +31,16 @@ namespace Theme
     const juce::Colour activeLine{ 0xff3b82f6 };
     const juce::Colour text      { 0xffe9ecef };
     const juce::Colour textDim   { 0xff9aa0a6 };
-    const juce::Colour wave      { 0xffffd000 };
-    const juce::Colour waveSel   { 0xffffe57a };
-    const juce::Colour ink       { 0xff0b0b0b };
-    const juce::Colour blobSel   { 0xfffff1b8 };
-    const juce::Colour env       { 0xff2f6bff };
+    const juce::Colour waveBg    { 0xff05070b };
+    const juce::Colour grid      { 0xff121a26 };
+    const juce::Colour scaleBg   { 0xff0b0f15 };
+    const juce::Colour scaleText { 0xffa9b6c8 };
+    const juce::Colour wave      { 0xff0a84ff };
+    const juce::Colour spot      { 0xff5b8cff };
+    const juce::Colour spotFill  { 0xff2f6bff };
+    const juce::Colour over      { 0xffff6a3d };   // audio above the threshold
+    const juce::Colour thresh    { 0xffffb020 };
+    const juce::Colour envLine   { 0xfff1f3f5 };
     const juce::Colour reset     { 0xffffc46b };
     const juce::Colour resetLine { 0xffe8a13a };
     const juce::Colour green     { 0xff7ff0b5 };
@@ -45,19 +49,20 @@ namespace Theme
 }
 
 //==============================================================================
-enum class Tool { select, range, envelope, blob };
+enum class Tool { select = 0, range, envelope, blob, peak };
 
-/** Floating "-5.0 dB  [Reset]" badge shown above the thing being edited. */
+/** "Blob  +3.0 dB  [Reset]" shown in the top-left corner of the waveform (never over the audio you edit). */
 class GainBadge : public juce::Component
 {
 public:
     GainBadge();
-    void setDb (float db);
+    void setInfo (const juce::String& what, float db);
     void paint (juce::Graphics&) override;
     void resized() override;
     std::function<void()> onReset;
 
 private:
+    juce::String label;
     float value = 0.0f;
     juce::TextButton resetButton { "Reset" };
 };
@@ -77,6 +82,7 @@ public:
     void mouseDrag (const juce::MouseEvent&) override;
     void mouseUp (const juce::MouseEvent&) override;
     void mouseMove (const juce::MouseEvent&) override;
+    void mouseExit (const juce::MouseEvent&) override;
     void mouseDoubleClick (const juce::MouseEvent&) override;
     void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
     void mouseMagnify (const juce::MouseEvent&, float scaleFactor) override;
@@ -91,12 +97,17 @@ public:
     void zoomVertical (float factor);
     void scrollTo (double startSample);
     double getViewStart() const noexcept { return viewStart; }
-    double getViewEnd() const noexcept { return viewStart + spp * getWidth(); }
+    double getViewEnd() const noexcept { return viewStart + spp * waveArea().getWidth(); }
+    double getSamplesPerPixel() const noexcept { return spp; }
     void followPlayhead (int64_t pos);
+    juce::Rectangle<int> waveArea() const;
+
+    /** Current blob size (follows the zoom). */
+    float currentResolution() const;
 
     // ---- selection & commands ----
     bool hasSelection() const noexcept { return selB > selA; }
-    /** The region a Reset / Loudness acts on: the range selection, else the selected blobs. */
+    /** The region Reset / Loudness act on: the range selection, else the selected spots. */
     bool getTargetRegion (int64_t& a, int64_t& b) const;
     void clearSelection();
 
@@ -104,58 +115,87 @@ public:
     void resetEverythingWithConfirm();
     void nudgeSelected (float db);
     void deleteSelected();
-    void mergeSelectedBlobs();
-    void applyResolutionToSelection (float resolution);
     void showContextMenu();
+
+    // ---- peaks ----
+    int countPeaksAbove();                    // whole take, cached
+    void selectAllPeaks();
+    void tameAllPeaks();
 
     int64_t getCursor() const noexcept { return cursor; }
 
-    std::function<void()> onStateChanged;   // selection / tool changed: editor refreshes buttons & loudness
+    std::function<void()> onStateChanged;   // selection / tool / view changed
     std::function<void()> onShowLoudness;
 
 private:
     // geometry
-    static constexpr int rulerHeight = 40;
-    juce::Rectangle<int> waveArea() const;
-    double xToPos (float x) const noexcept { return viewStart + (double) x * spp; }
-    float posToX (double pos) const noexcept { return (float) ((pos - viewStart) / spp); }
-    float dbToY (float db) const noexcept;
+    static constexpr int rulerHeight = 34;
+    static constexpr int scaleWidth = 56;
+    double xToPos (float x) const noexcept { return viewStart + (double) (x - (float) waveArea().getX()) * spp; }
+    float posToX (double pos) const noexcept { return (float) waveArea().getX() + (float) ((pos - viewStart) / spp); }
+    float ampToY (float amp, bool upper) const noexcept;
+    float dbToY (float db) const noexcept;     // envelope line
     float yToDb (float y) const noexcept;
     double sampleRate() const noexcept { return proc.getSampleRateForTimeline(); }
+    float thresholdGain() const { return juce::Decibels::decibelsToGain (proc.getThresholdDb()); }
 
     void paintRuler (juce::Graphics&, juce::Rectangle<int>);
+    void paintScale (juce::Graphics&, juce::Rectangle<int>, bool leftSide);
+    void paintGrid (juce::Graphics&, juce::Rectangle<int>);
     void paintWave (juce::Graphics&, juce::Rectangle<int>);
+    void paintSpots (juce::Graphics&, juce::Rectangle<int>);
     void paintEnvelope (juce::Graphics&, juce::Rectangle<int>);
-    void paintSelection (juce::Graphics&, juce::Rectangle<int>);
-    void paintBlobs (juce::Graphics&, juce::Rectangle<int>);
+    void paintThreshold (juce::Graphics&, juce::Rectangle<int>);
     void updateBadge();
 
+    // blobs follow the zoom: detected for the visible area and cached
+    void refreshSegments();
+    const Analysis::Segment* segmentAt (int64_t pos) const;
+    // peaks over the threshold in the visible area, cached
+    void refreshVisiblePeaks();
+    const Analysis::Peak* peakNear (int64_t pos) const;
+
     int rangeEditAt (int64_t pos) const;
-    int blobIndexAt (int64_t pos) const;
     int envPointNear (juce::Point<float> p) const;
-    std::vector<int> selectedBlobIndices() const;
+    std::vector<int> selectedSpotIndices() const;
+    void selectSpot (const SpotEdit& s, bool add);
     float stepFor (const juce::ModifierKeys& m) const noexcept { return m.isAltDown() ? 0.01f : 0.1f; }
+    void grabFocusForKeys();
+    void changed();
 
     GainEditorProcessor& proc;
     PeakCache& peaks;
     GainBadge badge;
 
-    Tool tool = Tool::range;
+    Tool tool = Tool::blob;
     double viewStart = 0.0, spp = 400.0;           // samples per pixel
-    float vZoom = 1.0f;                            // waveform height zoom
+    float vZoom = 1.0f;
     int64_t selA = 0, selB = 0, cursor = 0;
     int activeRange = -1;
-    std::set<int64_t> selectedBlobStarts;
     int selectedPoint = -1;
 
-    enum class Drag { none, newSelection, edgeA, edgeB, rangeGain, envPoint, blobGain, blobStart, blobEnd, ruler };
+    struct SpotKey { int64_t start, end; int kind; };
+    std::vector<SpotKey> selectedSpots;
+
+    std::vector<Analysis::Segment> segments;
+    int64_t segA = 0, segB = 0;
+    float segRes = -1.0f;
+    uint64_t segGeneration = 0;
+    int64_t hoverPos = -1;
+
+    std::vector<Analysis::Peak> visiblePeaks;
+    bool peaksDirty = true;
+    int peakCount = -1;
+
+    enum class Drag { none, newSelection, edgeA, edgeB, rangeGain, envPoint, spotGain, spotStart, spotEnd, ruler, threshold };
     Drag drag = Drag::none;
     int64_t dragAnchor = 0;
     float dragStartDb = 0.0f;
-    std::vector<float> dragStartBlobDb;
-    float lastDragY = 0.0f;
-    float dragDbAccum = 0.0f;
+    std::vector<float> dragStartSpotDb;
+    float lastDragY = 0.0f, dragDbAccum = 0.0f;
     bool dragMoved = false;
+    juce::Point<float> lastClick;
+    int clickCycle = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (WaveformView)
 };

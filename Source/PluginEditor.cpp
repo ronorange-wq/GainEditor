@@ -12,12 +12,12 @@ ToolButton::ToolButton (const juce::String& text, Icon i, Accent a)
 int ToolButton::getIdealWidth() const
 {
     if (label.isEmpty() || ! showText)
-        return 50;
+        return 44;
     juce::GlyphArrangement ga;
-    ga.addLineOfText (juce::Font (juce::FontOptions (17.0f)), label, 0, 0);
+    ga.addLineOfText (juce::Font (juce::FontOptions (15.0f)), label, 0, 0);
     auto w = (int) ga.getBoundingBox (0, -1, true).getWidth();
-    if (hint.isNotEmpty()) w += 28;
-    return w + (icon == Icon::none ? 30 : 60);
+    if (hint.isNotEmpty()) w += 26;
+    return w + (icon == Icon::none ? 30 : 56);
 }
 
 void ToolButton::paintButton (juce::Graphics& g, bool highlighted, bool down)
@@ -51,7 +51,7 @@ void ToolButton::paintButton (juce::Graphics& g, bool highlighted, bool down)
     g.setColour (line);
     g.drawRoundedRectangle (r, 9.0f, 1.0f);
 
-    auto content = r.reduced (12.0f, 0.0f);
+    auto content = r.reduced (10.0f, 0.0f);
     const bool hasText = label.isNotEmpty() && showText;
 
     if (icon != Icon::none)
@@ -64,7 +64,7 @@ void ToolButton::paintButton (juce::Graphics& g, bool highlighted, bool down)
     if (hasText)
     {
         g.setColour (fg);
-        g.setFont (juce::FontOptions (17.0f));
+        g.setFont (juce::FontOptions (15.0f));
         auto textArea = content;
         if (hint.isNotEmpty())
         {
@@ -74,7 +74,7 @@ void ToolButton::paintButton (juce::Graphics& g, bool highlighted, bool down)
             g.setFont (juce::FontOptions (11.0f));
             g.drawText (hint, h, juce::Justification::centred);
             g.setColour (fg);
-            g.setFont (juce::FontOptions (17.0f));
+            g.setFont (juce::FontOptions (15.0f));
         }
         g.drawText (label, textArea, juce::Justification::centredLeft);
     }
@@ -143,6 +143,26 @@ void ToolButton::drawIcon (juce::Graphics& g, Icon icon, juce::Rectangle<float> 
             p.lineTo (x + w, y + h * 0.5f);
             g.strokePath (p, stroke);
             break;
+        case Icon::peak:
+            p.startNewSubPath (x, y + h * 0.85f);
+            p.lineTo (x + w * 0.3f, y + h * 0.85f);
+            p.lineTo (x + w * 0.5f, y + h * 0.1f);
+            p.lineTo (x + w * 0.7f, y + h * 0.85f);
+            p.lineTo (x + w, y + h * 0.85f);
+            g.strokePath (p, stroke);
+            {
+                float dashes[] = { 2.5f, 2.0f };
+                g.drawDashedLine (juce::Line<float> (x, y + h * 0.38f, x + w, y + h * 0.38f), dashes, 2, 1.4f);
+            }
+            break;
+        case Icon::link:
+        {
+            const auto r1 = juce::Rectangle<float> (x + w * 0.05f, y + h * 0.32f, w * 0.52f, h * 0.36f);
+            const auto r2 = juce::Rectangle<float> (x + w * 0.43f, y + h * 0.32f, w * 0.52f, h * 0.36f);
+            g.drawRoundedRectangle (r1, h * 0.18f, 1.8f);
+            g.drawRoundedRectangle (r2, h * 0.18f, 1.8f);
+            break;
+        }
         case Icon::reset:
         case Icon::undo:
         case Icon::redo:
@@ -204,65 +224,60 @@ void ToolButton::drawIcon (juce::Graphics& g, Icon icon, juce::Rectangle<float> 
 }
 
 //==============================================================================
-// BlobBar
+// PeakBar
 //==============================================================================
-BlobBar::BlobBar()
+PeakBar::PeakBar()
 {
-    resolution.setSliderStyle (juce::Slider::LinearHorizontal);
-    resolution.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
-    resolution.setRange (0.0, 1.0, 0.0);
-    resolution.setColour (juce::Slider::trackColourId, Theme::wave);
-    resolution.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff2a2f36));
-    resolution.setColour (juce::Slider::thumbColourId, Theme::text);
-    resolution.setTooltip ("Blob size: drag right for smaller blobs, all the way to single peaks");
-    addAndMakeVisible (resolution);
-
-    valueLabel.setColour (juce::Label::textColourId, Theme::wave);
-    valueLabel.setFont (juce::FontOptions (15.0f, juce::Font::bold));
-    valueLabel.setJustificationType (juce::Justification::centredLeft);
-    addAndMakeVisible (valueLabel);
-
-    applyToSelection.setColour (juce::TextButton::buttonColourId, Theme::button);
-    applyToSelection.setColour (juce::TextButton::textColourOffId, Theme::text);
-    applyToSelection.setTooltip ("Use this resolution only inside the selected region");
-    addAndMakeVisible (applyToSelection);
+    for (auto* b : { &selectAll, &tame })
+    {
+        b->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a1f0e));
+        b->setColour (juce::TextButton::textColourOffId, Theme::reset);
+        b->setColour (juce::ComboBox::outlineColourId, Theme::thresh);
+        b->setWantsKeyboardFocus (false);
+        addAndMakeVisible (b);
+    }
+    tame.setColour (juce::TextButton::buttonColourId, Theme::thresh);
+    tame.setColour (juce::TextButton::textColourOffId, juce::Colour (0xff14161a));
+    selectAll.setTooltip ("Select every peak over the threshold, then drag or use the arrow keys");
+    tame.setTooltip ("Bring every peak down to the threshold (only inside the Range selection, if there is one)");
+    setSize (520, 42);
 }
 
-void BlobBar::paint (juce::Graphics& g)
+void PeakBar::setInfo (float thresholdDb, int peaksAbove)
+{
+    if (! juce::exactlyEqual (thresholdDb, thr) || peaksAbove != count)
+    {
+        thr = thresholdDb;
+        count = peaksAbove;
+        tame.setButtonText ("Tame to " + juce::String (juce::CharPointer_UTF8 ("\xe2\x88\x92")) + juce::String (std::abs (thr), 1) + " dB");
+        repaint();
+    }
+}
+
+void PeakBar::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds().toFloat().reduced (1.0f);
-    g.setColour (juce::Colour (0xee121418));
-    g.fillRoundedRectangle (r, 10.0f);
-    g.setColour (juce::Colour (0xff3a3f47));
-    g.drawRoundedRectangle (r, 10.0f, 1.0f);
+    g.setColour (juce::Colour (0xeb121418));
+    g.fillRoundedRectangle (r, 9.0f);
+    g.setColour (Theme::thresh);
+    g.drawRoundedRectangle (r, 9.0f, 1.2f);
 
-    g.setColour (Theme::textDim);
-    g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
-    g.drawText ("BLOB RESOLUTION", 14, 8, 150, 16, juce::Justification::centredLeft);
-
-    g.setFont (juce::FontOptions (11.0f));
-    const auto sl = resolution.getBounds();
-    const char* names[] = { "Phrase", "Word", "Syllable", "Peak" };
-    for (int i = 0; i < 4; ++i)
-    {
-        const auto fx = sl.getX() + 10 + (int) ((sl.getWidth() - 20) * (i / 3.0f));
-        g.drawText (names[i], fx - 30, sl.getBottom() - 2, 60, 14, juce::Justification::centred);
-    }
-
-    g.setColour (Theme::textDim.withAlpha (0.8f));
-    g.drawText ("Double-click: split   M: merge   Drag edges: widen / narrow   Option: fine",
-                getLocalBounds().removeFromBottom (20).reduced (14, 0), juce::Justification::centredLeft);
+    g.setFont (juce::FontOptions (14.0f));
+    g.setColour (Theme::text);
+    g.drawText ("Threshold", 14, 0, 70, getHeight(), juce::Justification::centredLeft);
+    g.setColour (Theme::thresh);
+    g.setFont (juce::FontOptions (14.0f, juce::Font::bold));
+    g.drawText (juce::String (juce::CharPointer_UTF8 ("\xe2\x88\x92")) + juce::String (std::abs (thr), 1) + " dB", 84, 0, 70, getHeight(), juce::Justification::centredLeft);
+    g.setColour (Theme::over);
+    g.drawText (juce::String (count) + (count == 1 ? " peak above" : " peaks above"), 158, 0, 120, getHeight(), juce::Justification::centredLeft);
 }
 
-void BlobBar::resized()
+void PeakBar::resized()
 {
-    auto r = getLocalBounds().reduced (12, 6);
-    r.removeFromBottom (16);
-    r.removeFromTop (18);
-    auto right = r.removeFromRight (160);
-    applyToSelection.setBounds (right.withSizeKeepingCentre (156, 28));
-    valueLabel.setBounds (r.removeFromRight (80));
-    resolution.setBounds (r.withTrimmedBottom (10));
+    auto r = getLocalBounds().reduced (7);
+    tame.setBounds (r.removeFromRight (128));
+    r.removeFromRight (8);
+    selectAll.setBounds (r.removeFromRight (92));
 }
 
 //==============================================================================
@@ -273,7 +288,7 @@ GainEditorEditor::GainEditorEditor (GainEditorProcessor& p)
 {
     setWantsKeyboardFocus (true);
 
-    for (auto* b : { &playBtn, &stopBtn, &recordBtn, &selectBtn, &rangeBtn, &envBtn, &blobBtn, &resetBtn, &loudBtn,
+    for (auto* b : { &playBtn, &stopBtn, &syncBtn, &recordBtn, &selectBtn, &rangeBtn, &envBtn, &blobBtn, &peakBtn, &resetBtn, &loudBtn,
                      &undoBtn, &redoBtn, &zoomOutBtn, &zoomInBtn, &fitBtn })
     {
         b->setWantsKeyboardFocus (false);
@@ -281,30 +296,56 @@ GainEditorEditor::GainEditorEditor (GainEditorProcessor& p)
     }
 
     resetBtn.setAlwaysAccent (ToolButton::Accent::orange);
+    syncBtn.setAlwaysAccent (ToolButton::Accent::normal);
+    selectBtn.setShortcutHint ("1");
+    rangeBtn.setShortcutHint ("2");
+    envBtn.setShortcutHint ("3");
+    blobBtn.setShortcutHint ("4");
+    peakBtn.setShortcutHint ("5");
     loudBtn.setShortcutHint ("L");
 
-    playBtn.setTooltip ("Play the selection (or from the cursor) inside the plugin  [Space]");
+    playBtn.setTooltip ("Play  [Space]. With Ableton on, this starts Ableton (all tracks together).");
     stopBtn.setTooltip ("Stop");
+    syncBtn.setTooltip ("Ableton: Play / Stop here also start / stop Ableton. Right-click for setup.");
     recordBtn.setTooltip ("Capture: while on, press play in Ableton and the track is recorded into the plugin");
-    selectBtn.setTooltip ("Select: click a blob or range to pick it, drag up/down for gain  [1]");
-    rangeBtn.setTooltip ("Range: drag to select, then drag up/down inside it  [2]");
-    envBtn.setTooltip ("Envelope: click to add points, drag them, double-click to delete  [3]");
-    blobBtn.setTooltip ("Blob: click a blob, drag up/down; Shift-click for several  [4]");
+    selectBtn.setTooltip ("Select [1]: click an edit to pick it (click again for the one underneath), drag up/down");
+    rangeBtn.setTooltip ("Range [2]: drag to select, then drag up/down inside it");
+    envBtn.setTooltip ("Envelope [3]: click to add points, drag them, double-click to delete");
+    blobBtn.setTooltip ("Blob [4]: hover and drag up/down. Zoom in for smaller blobs, out for bigger ones");
+    peakBtn.setTooltip ("Peak [5]: peaks over the orange line are marked; click one and drag, or Tame them all");
     resetBtn.setTooltip ("Return the selected part to how it was recorded  [Cmd+R]");
     loudBtn.setTooltip ("Loudness of the selection: hold L, Shift+L to pin");
     undoBtn.setTooltip ("Undo  [Cmd+Z]");
     redoBtn.setTooltip ("Redo  [Shift+Cmd+Z]");
     zoomOutBtn.setTooltip ("Zoom out  [-]");
     zoomInBtn.setTooltip ("Zoom in  [+]");
-    fitBtn.setTooltip ("Show the whole recording");
+    fitBtn.setTooltip ("Show the whole recording  [F]");
 
     playBtn.onClick = [this] { togglePlay(); };
-    stopBtn.onClick = [this] { proc.stopAudition(); refreshButtons(); };
+    stopBtn.onClick = [this]
+    {
+        proc.stopAudition();
+        if (proc.isAbletonSync()) proc.sendTransport (false);
+        refreshButtons();
+    };
+    syncBtn.onClick = [this]
+    {
+        if (juce::ModifierKeys::currentModifiers.isPopupMenu()) { showSyncHelp(); return; }
+        const bool on = ! proc.isAbletonSync();
+        proc.setAbletonSync (on);
+        if (on && ! (bool) proc.uiState.getProperty ("syncHelpShown", false))
+        {
+            proc.uiState.setProperty ("syncHelpShown", true, nullptr);
+            showSyncHelp();
+        }
+        refreshButtons();
+    };
     recordBtn.onClick = [this] { proc.setCapturing (! proc.isCapturing()); refreshButtons(); };
     selectBtn.onClick = [this] { selectTool (Tool::select); };
     rangeBtn.onClick = [this] { selectTool (Tool::range); };
     envBtn.onClick = [this] { selectTool (Tool::envelope); };
     blobBtn.onClick = [this] { selectTool (Tool::blob); };
+    peakBtn.onClick = [this] { selectTool (Tool::peak); };
     resetBtn.onClick = [this] { view.resetTarget (EditOps::resetEverything); };
     loudBtn.onClick = [this] { loudness.setPinned (! loudness.isPinned()); showLoudness (loudness.isPinned()); };
     undoBtn.onClick = [this] { proc.getUndoManager().undo(); };
@@ -315,42 +356,23 @@ GainEditorEditor::GainEditorEditor (GainEditorProcessor& p)
 
     addAndMakeVisible (overview);
     addAndMakeVisible (view);
-    addChildComponent (blobBar);
+    addChildComponent (peakBar);
     addChildComponent (loudness);
 
-    view.onStateChanged = [this] { loudnessNeedsUpdate = true; refreshButtons(); overview.repaint(); };
-    view.onShowLoudness = [this] { loudness.setPinned (true); showLoudness (true); };
+    peakBar.selectAll.onClick = [this] { view.selectAllPeaks(); };
+    peakBar.tame.onClick = [this] { view.tameAllPeaks(); };
 
-    blobBar.resolution.setValue (proc.getEdits().blobResolution, juce::dontSendNotification);
-    blobBar.valueLabel.setText (Analysis::resolutionName (proc.getEdits().blobResolution), juce::dontSendNotification);
-    blobBar.resolution.onDragStart = [this] { resolutionDragging = true; proc.beginDrag(); };
-    blobBar.resolution.onValueChange = [this]
-    {
-        blobBar.valueLabel.setText (Analysis::resolutionName ((float) blobBar.resolution.getValue()), juce::dontSendNotification);
-        resolutionPending = true;
-        lastResolutionChange = juce::Time::getMillisecondCounter();
-    };
-    blobBar.resolution.onDragEnd = [this]
-    {
-        auto s = proc.getEdits();
-        s.blobResolution = (float) blobBar.resolution.getValue();
-        Analysis::redetect (s, proc.getCapture(), s.blobResolution);
-        proc.setEdits (s, false);
-        resolutionPending = false;
-        resolutionDragging = false;
-        proc.commitDrag ("Blob Resolution");
-    };
-    blobBar.applyToSelection.onClick = [this] { view.applyResolutionToSelection ((float) blobBar.resolution.getValue()); };
+    view.onStateChanged = [this] { loudnessNeedsUpdate = true; refreshButtons(); overview.repaint(); repaint (0, getHeight() - 30, getWidth(), 30); };
+    view.onShowLoudness = [this] { loudness.setPinned (true); showLoudness (true); };
 
     proc.addChangeListener (this);
 
-    // restore UI
-    const auto w = (int) proc.uiState.getProperty ("w", 1400);
-    const auto h = (int) proc.uiState.getProperty ("h", 780);
+    const auto w = (int) proc.uiState.getProperty ("w", 1560);
+    const auto h = (int) proc.uiState.getProperty ("h", 800);
     setResizable (true, true);
-    setResizeLimits (1000, 520, 3000, 2000);
+    setResizeLimits (1100, 540, 3200, 2000);
     setSize (w, h);
-    selectTool ((Tool) (int) proc.uiState.getProperty ("tool", (int) Tool::range));
+    selectTool ((Tool) juce::jlimit (0, 4, (int) proc.uiState.getProperty ("tool", (int) Tool::blob)));
 
     peaks.update (proc.getCapture(), 0, proc.getCapture().getWrittenEnd());
     startTimerHz (30);
@@ -367,57 +389,102 @@ GainEditorEditor::~GainEditorEditor()
 void GainEditorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (Theme::bg);
-    auto bar = getLocalBounds().removeFromTop (64);
+    auto bar = getLocalBounds().removeFromTop (60);
     g.setColour (Theme::bar);
     g.fillRect (bar);
     g.setColour (juce::Colours::black);
     g.fillRect (bar.removeFromBottom (1));
 
     g.setColour (juce::Colour (0xfff1f3f5));
-    g.setFont (juce::FontOptions (28.0f, juce::Font::bold));
-    g.drawText ("Gain Editor", 18, 0, 190, 64, juce::Justification::centredLeft);
+    g.setFont (juce::FontOptions (25.0f, juce::Font::bold));
+    g.drawText ("Gain Editor", 16, 0, 170, 60, juce::Justification::centredLeft);
 
-    // thin separators between button groups
     g.setColour (Theme::buttonLine);
-    for (auto* b : { &recordBtn, &blobBtn })
-        g.fillRect (b->getRight() + 8, 16, 1, 32);
+    for (auto* b : { &recordBtn, &peakBtn, &loudBtn })
+        g.fillRect (b->getRight() + 7, 16, 1, 28);
 
-    g.setColour (juce::Colour (0xff1c1f24));
-    g.fillRect (getLocalBounds().removeFromBottom (12));
+    // status bar
+    auto status = getLocalBounds().removeFromBottom (30);
+    g.setColour (Theme::bar);
+    g.fillRect (status);
+    g.setColour (juce::Colours::black);
+    g.fillRect (status.removeFromTop (1));
+    status.reduce (14, 0);
+
+    g.setFont (juce::FontOptions (13.0f));
+    auto item = [&] (const juce::String& k, const juce::String& v, juce::Colour c)
+    {
+        juce::GlyphArrangement ga;
+        ga.addLineOfText (juce::Font (juce::FontOptions (13.0f)), k, 0, 0);
+        const auto kw = (int) ga.getBoundingBox (0, -1, true).getWidth() + 4;
+        g.setColour (Theme::textDim);
+        g.drawText (k, status.removeFromLeft (kw), juce::Justification::centredLeft);
+        g.setColour (c);
+        g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
+        ga.clear();
+        ga.addLineOfText (juce::Font (juce::FontOptions (13.0f, juce::Font::bold)), v, 0, 0);
+        g.drawText (v, status.removeFromLeft ((int) ga.getBoundingBox (0, -1, true).getWidth() + 26), juce::Justification::centredLeft);
+        g.setFont (juce::FontOptions (13.0f));
+    };
+    item ("Blob size follows zoom: ", Analysis::resolutionName (view.currentResolution()), Theme::text);
+    item ("Threshold: ", juce::String (proc.getThresholdDb(), 1) + " dB", Theme::thresh);
+    item ("Option: ", "fine", Theme::text);
+    item ("Ableton sync: ", proc.isAbletonSync() ? (proc.hasMidiPort() ? "On" : "On (no MIDI port)") : "Off",
+          proc.isAbletonSync() ? Theme::green : Theme::textDim);
+
+    const auto sr = proc.getSampleRateForTimeline();
+    const auto sec = (double) proc.getPlayPosition() / sr;
+    const auto m = (int) (sec / 60.0);
+    auto rest = juce::String (sec - m * 60.0, 2);
+    if (sec - m * 60.0 < 10.0) rest = "0" + rest;
+    g.setColour (Theme::textDim);
+    g.drawText (juce::String (m) + ":" + rest, status, juce::Justification::centredRight);
 }
 
 void GainEditorEditor::resized()
 {
     auto r = getLocalBounds();
-    auto bar = r.removeFromTop (64).reduced (10, 9);
-    bar.removeFromLeft (200);
+    auto bar = r.removeFromTop (60).reduced (10, 9);
+    bar.removeFromLeft (178);
 
-    const bool compact = getWidth() < 1380;
-    for (auto* b : { &rangeBtn, &envBtn, &blobBtn, &resetBtn, &loudBtn, &recordBtn })
-        b->setShowText (! compact);
+    // Show text on the buttons when there is room; drop it (least important first) when there isn't.
+    ToolButton* all[] = { &playBtn, &stopBtn, &syncBtn, &recordBtn, &selectBtn, &rangeBtn, &envBtn, &blobBtn, &peakBtn,
+                          &resetBtn, &loudBtn, &undoBtn, &redoBtn, &zoomOutBtn, &zoomInBtn, &fitBtn };
+    ToolButton* dropOrder[] = { &recordBtn, &syncBtn, &loudBtn, &resetBtn, &selectBtn, &envBtn, &rangeBtn, &blobBtn, &peakBtn };
+    for (auto* b : dropOrder) b->setShowText (true);
+    auto needed = [&]
+    {
+        int w = 15 * 3 + 8;
+        for (auto* b : all) w += b->getIdealWidth() + 6;
+        return w;
+    };
+    for (auto* b : dropOrder)
+        if (needed() > bar.getWidth()) b->setShowText (false);
 
     auto place = [&bar] (ToolButton& b, int gap = 6) { b.setBounds (bar.removeFromLeft (b.getIdealWidth())); bar.removeFromLeft (gap); };
 
-    place (playBtn, 0);
-    place (stopBtn, 10);
-    place (recordBtn, 17);
+    place (playBtn, 4);
+    place (stopBtn, 6);
+    place (syncBtn, 6);
+    place (recordBtn, 15);
     place (selectBtn);
     place (rangeBtn);
     place (envBtn);
-    place (blobBtn, 17);
+    place (blobBtn);
+    place (peakBtn, 15);
     place (resetBtn);
-    place (loudBtn);
+    place (loudBtn, 15);
 
     auto placeRight = [&bar] (ToolButton& b) { b.setBounds (bar.removeFromRight (b.getIdealWidth())); bar.removeFromRight (6); };
     placeRight (fitBtn);
     placeRight (zoomInBtn);
     placeRight (zoomOutBtn);
-    bar.removeFromRight (10);
+    bar.removeFromRight (8);
     placeRight (redoBtn);
     placeRight (undoBtn);
 
-    overview.setBounds (r.removeFromTop (76));
-    r.removeFromBottom (12);
+    overview.setBounds (r.removeFromTop (62));
+    r.removeFromBottom (30);
     view.setBounds (r);
 
     layoutOverlays();
@@ -431,25 +498,55 @@ void GainEditorEditor::resized()
 
 void GainEditorEditor::layoutOverlays()
 {
-    const auto v = view.getBounds();
-    blobBar.setBounds (v.getX() + 12, v.getY() + 48, juce::jmin (720, v.getWidth() - 24), 84);
-    loudness.setTopRightPosition (v.getRight() - 16, v.getY() + 56);
+    const auto wa = view.waveArea().translated (view.getX(), view.getY());
+    peakBar.setTopRightPosition (wa.getRight() - 10, wa.getY() + 10);
+    loudness.setTopRightPosition (wa.getRight() - 10, wa.getY() + (peakBar.isVisible() ? 60 : 10));
 }
 
 //==============================================================================
 void GainEditorEditor::selectTool (Tool t)
 {
     view.setTool (t);
-    blobBar.setVisible (t == Tool::blob);
-
-    if (t == Tool::blob && proc.getEdits().blobs.empty() && proc.getCapture().hasData())
-        proc.redetectBlobs ((float) blobBar.resolution.getValue());
-
+    peakBar.setVisible (t == Tool::peak);
+    layoutOverlays();
     refreshButtons();
+    grabKeyboardFocus();
+}
+
+void GainEditorEditor::cycleTool (int direction)
+{
+    const auto n = (int) view.getTool();
+    selectTool ((Tool) ((n + direction + 5) % 5));
+}
+
+void GainEditorEditor::showSyncHelp()
+{
+    juce::AlertWindow::showAsync (juce::MessageBoxOptions()
+        .withIconType (juce::MessageBoxIconType::InfoIcon)
+        .withTitle ("Play Ableton from Gain Editor - one-time setup")
+        .withMessage ("1. Ableton > Settings > Link, Tempo & MIDI: next to the input \"Gain Editor\" turn on Remote.\n"
+                      "2. Press Cmd+M in Ableton (MIDI Map mode).\n"
+                      "3. Click Ableton's Play button, then click Play in Gain Editor.\n"
+                      "4. Click Ableton's Stop button, then click Stop in Gain Editor.\n"
+                      "5. Press Cmd+M again to leave MIDI Map mode.\n\n"
+                      "Now Play / Stop here start and stop Ableton, and every track plays together.\n"
+                      "Ableton starts from its own position marker (Ableton does not let plugins move it).")
+        .withButton ("OK")
+        .withAssociatedComponent (this),
+        nullptr);
 }
 
 void GainEditorEditor::togglePlay()
 {
+    if (proc.isAbletonSync())
+    {
+        // Ableton plays every track (with our edits on this one). Toggle like Ableton's space bar.
+        proc.stopAudition();
+        proc.sendTransport (! proc.isHostPlaying());
+        refreshButtons();
+        return;
+    }
+
     if (proc.isAuditioning())
     {
         proc.stopAudition();
@@ -475,8 +572,10 @@ void GainEditorEditor::refreshButtons()
     rangeBtn.setActive (tool == Tool::range);
     envBtn.setActive (tool == Tool::envelope);
     blobBtn.setActive (tool == Tool::blob);
+    peakBtn.setActive (tool == Tool::peak);
     recordBtn.setActive (proc.isCapturing());
-    playBtn.setActive (proc.isAuditioning());
+    syncBtn.setActive (proc.isAbletonSync());
+    playBtn.setActive (proc.isAuditioning() || (proc.isAbletonSync() && proc.isHostPlaying()));
 
     int64_t a, b;
     const bool target = view.getTargetRegion (a, b);
@@ -484,20 +583,15 @@ void GainEditorEditor::refreshButtons()
     loudBtn.setActive (loudness.isVisible());
     undoBtn.setEnabled (proc.getUndoManager().canUndo());
     redoBtn.setEnabled (proc.getUndoManager().canRedo());
-    playBtn.setEnabled (proc.getCapture().hasData());
-    blobBar.applyToSelection.setEnabled (target);
+    playBtn.setEnabled (proc.getCapture().hasData() || proc.isAbletonSync());
 }
 
 void GainEditorEditor::changeListenerCallback (juce::ChangeBroadcaster*)
 {
     loudnessNeedsUpdate = true;
-    if (! resolutionDragging)
-    {
-        blobBar.resolution.setValue (proc.getEdits().blobResolution, juce::dontSendNotification);
-        blobBar.valueLabel.setText (Analysis::resolutionName (proc.getEdits().blobResolution), juce::dontSendNotification);
-    }
     refreshButtons();
     overview.repaint();
+    repaint (0, getHeight() - 30, getWidth(), 30);
 }
 
 void GainEditorEditor::showLoudness (bool show)
@@ -505,6 +599,7 @@ void GainEditorEditor::showLoudness (bool show)
     loudness.setVisible (show);
     if (show)
     {
+        layoutOverlays();
         loudness.toFront (false);
         updateLoudness();
     }
@@ -531,6 +626,7 @@ void GainEditorEditor::updateLoudness()
         if (sec - m * 60.0 < 10.0) rest = "0" + rest;
         return juce::String (m) + ":" + rest;
     };
+    loudness.setTarget (-18.0f);
     loudness.setReport (rep, t (a) + " - " + t (b) + "  |  " + juce::String (rep.seconds, 2) + " s");
 }
 
@@ -539,15 +635,14 @@ void GainEditorEditor::timerCallback()
 {
     auto& cap = proc.getCapture();
 
-    // keep the waveform picture in step with what is being recorded
     int64_t d0, d1;
-    bool changed = false;
+    bool changedAudio = false;
     if (cap.takeDirtyRange (d0, d1))
     {
         if (cap.getWrittenEnd() < lastWrittenEnd)
             peaks.clear();
         peaks.update (cap, d0, d1);
-        changed = true;
+        changedAudio = true;
     }
     lastWrittenEnd = cap.getWrittenEnd();
 
@@ -557,35 +652,23 @@ void GainEditorEditor::timerCallback()
         view.zoomToFit();
     }
 
-    // live blob resolution while the slider is dragged
-    if (resolutionPending && resolutionDragging && juce::Time::getMillisecondCounter() - lastResolutionChange > 60)
-    {
-        resolutionPending = false;
-        auto s = proc.getEdits();
-        s.blobResolution = (float) blobBar.resolution.getValue();
-        Analysis::redetect (s, cap, s.blobResolution);
-        proc.setEdits (s, false);
-    }
-    else if (resolutionPending && ! resolutionDragging)
-    {
-        resolutionPending = false;
-        proc.redetectBlobs ((float) blobBar.resolution.getValue());
-    }
-
     const bool moving = proc.isHostPlaying() || proc.isAuditioning();
     if (moving)
         view.followPlayhead (proc.getPlayPosition());
 
-    if (changed || moving || proc.isCapturing())
+    if (changedAudio || moving || proc.isCapturing())
     {
         view.repaint();
         overview.repaint();
+        repaint (0, getHeight() - 30, getWidth(), 30);
     }
+
+    if (peakBar.isVisible())
+        peakBar.setInfo (proc.getThresholdDb(), view.countPeaksAbove());
 
     if (loudness.isVisible() && loudnessNeedsUpdate)
         updateLoudness();
 
-    // L released?
     if (loudnessHeld && ! juce::KeyPress::isKeyCurrentlyDown ('L') && ! juce::KeyPress::isKeyCurrentlyDown ('l'))
     {
         loudnessHeld = false;
@@ -593,10 +676,8 @@ void GainEditorEditor::timerCallback()
             showLoudness (false);
     }
 
-    if (playBtn.getToggleState() != proc.isAuditioning())
-        refreshButtons();
     recordBtn.setActive (proc.isCapturing());
-    playBtn.setActive (proc.isAuditioning());
+    playBtn.setActive (proc.isAuditioning() || (proc.isAbletonSync() && proc.isHostPlaying()));
 }
 
 bool GainEditorEditor::keyStateChanged (bool isKeyDown)
@@ -629,7 +710,9 @@ bool GainEditorEditor::keyPressed (const juce::KeyPress& key)
         return true;
     }
     if (cmd)
-        return false; // leave other shortcuts to the host
+        return false;
+
+    if (key == juce::KeyPress::tabKey) { cycleTool (mods.isShiftDown() ? -1 : 1); return true; }
 
     if (code == 'L' || ch == 'l')
     {
@@ -638,14 +721,11 @@ bool GainEditorEditor::keyPressed (const juce::KeyPress& key)
             loudness.setPinned (! loudness.isPinned());
             showLoudness (loudness.isPinned());
         }
-        else if (! loudness.isVisible())
-        {
-            loudnessHeld = true;
-            showLoudness (true);
-        }
         else
         {
             loudnessHeld = true;
+            if (! loudness.isVisible())
+                showLoudness (true);
         }
         return true;
     }
@@ -666,11 +746,11 @@ bool GainEditorEditor::keyPressed (const juce::KeyPress& key)
         case '2': selectTool (Tool::range); return true;
         case '3': selectTool (Tool::envelope); return true;
         case '4': selectTool (Tool::blob); return true;
+        case '5': selectTool (Tool::peak); return true;
         case '+': case '=': view.zoomBy (1.6); return true;
         case '-': case '_': view.zoomBy (1.0 / 1.6); return true;
         case 'z': view.zoomToSelection(); return true;
         case 'f': view.zoomToFit(); return true;
-        case 'm': view.mergeSelectedBlobs(); return true;
         default: break;
     }
     return false;

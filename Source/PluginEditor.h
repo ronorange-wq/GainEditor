@@ -9,7 +9,7 @@
 class ToolButton : public juce::Button
 {
 public:
-    enum class Icon { none, play, stop, record, pointer, range, envelope, blob, reset, loudness, zoomOut, zoomIn, fit, undo, redo };
+    enum class Icon { none, play, stop, record, pointer, range, envelope, blob, peak, link, reset, loudness, zoomOut, zoomIn, fit, undo, redo };
     enum class Accent { normal, blue, orange, green, red };
 
     ToolButton (const juce::String& text, Icon icon, Accent activeAccent = Accent::blue);
@@ -30,17 +30,20 @@ private:
 };
 
 //==============================================================================
-/** Resolution controls shown over the waveform while the Blob tool is active. */
-class BlobBar : public juce::Component
+/** Threshold / peak count / Select all / Tame, shown over the waveform with the Peak tool. */
+class PeakBar : public juce::Component
 {
 public:
-    BlobBar();
+    PeakBar();
+    void setInfo (float thresholdDb, int peaksAbove);
     void paint (juce::Graphics&) override;
     void resized() override;
 
-    juce::Slider resolution;
-    juce::TextButton applyToSelection { "Apply to selection" };
-    juce::Label valueLabel;
+    juce::TextButton selectAll { "Select all" }, tame { "Tame" };
+
+private:
+    float thr = -6.0f;
+    int count = 0;
 };
 
 //==============================================================================
@@ -72,23 +75,25 @@ private:
     WaveformView view;
     OverviewStrip overview;
     LoudnessPanel loudness;
-    BlobBar blobBar;
+    PeakBar peakBar;
     juce::TooltipWindow tooltips { this, 600 };
 
     ToolButton playBtn { {}, ToolButton::Icon::play }, stopBtn { {}, ToolButton::Icon::stop };
     ToolButton recordBtn { "Record", ToolButton::Icon::record, ToolButton::Accent::red };
-    ToolButton selectBtn { {}, ToolButton::Icon::pointer };
+    ToolButton selectBtn { "Select", ToolButton::Icon::pointer };
     ToolButton rangeBtn { "Range", ToolButton::Icon::range };
     ToolButton envBtn { "Envelope", ToolButton::Icon::envelope };
     ToolButton blobBtn { "Blob", ToolButton::Icon::blob };
+    ToolButton peakBtn { "Peak", ToolButton::Icon::peak };
+    ToolButton syncBtn { "Ableton", ToolButton::Icon::link, ToolButton::Accent::green };
     ToolButton resetBtn { "Reset", ToolButton::Icon::reset, ToolButton::Accent::orange };
     ToolButton loudBtn { "Loudness", ToolButton::Icon::loudness, ToolButton::Accent::green };
     ToolButton undoBtn { {}, ToolButton::Icon::undo }, redoBtn { {}, ToolButton::Icon::redo };
     ToolButton zoomOutBtn { {}, ToolButton::Icon::zoomOut }, zoomInBtn { {}, ToolButton::Icon::zoomIn }, fitBtn { {}, ToolButton::Icon::fit };
 
     bool loudnessHeld = false, loudnessNeedsUpdate = true, didInitialFit = false;
-    bool resolutionDragging = false, resolutionPending = false;
-    juce::uint32 lastResolutionChange = 0;
+    void cycleTool (int direction);
+    void showSyncHelp();
     int64_t lastWrittenEnd = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GainEditorEditor)

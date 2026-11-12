@@ -2,7 +2,7 @@
 #include <JuceHeader.h>
 #include <vector>
 
-/** A region of the timeline with a gain change (used by the Range layer). */
+/** A region of the timeline with a gain change (Range tool). */
 struct RangeEdit
 {
     int64_t start = 0, end = 0;   // timeline samples, [start, end)
@@ -16,11 +16,19 @@ struct EnvPoint
     float db = 0.0f;
 };
 
-/** A detected (or hand-adjusted) blob and its gain. */
-struct Blob
+/**
+    A gain change made with the Blob or Peak tool. It is locked to its place in time:
+    zooming (which changes the blob size) never moves or resizes it.
+    Spots may overlap; their gains add up (a word +3 dB, a peak inside it -6 dB).
+*/
+struct SpotEdit
 {
+    enum Kind : int { blob = 0, peak = 1 };
     int64_t start = 0, end = 0;
     float db = 0.0f;
+    int kind = blob;
+
+    bool sameRegion (int64_t s, int64_t e) const noexcept { return start == s && end == e; }
 };
 
 /** Everything the user has edited. Plain value type: copied for undo snapshots. */
@@ -28,8 +36,7 @@ struct EditState
 {
     std::vector<RangeEdit> ranges;
     std::vector<EnvPoint> envelope;    // kept sorted by pos
-    std::vector<Blob> blobs;           // kept sorted by start, non-overlapping
-    float blobResolution = 0.6f;       // 0 = Phrase ... 1 = Peak
+    std::vector<SpotEdit> spots;       // kept sorted by start
 
     bool operator== (const EditState& o) const;
     bool operator!= (const EditState& o) const { return ! (*this == o); }
@@ -54,22 +61,29 @@ struct GainMap
 
 namespace EditOps
 {
-    constexpr float edgeFadeSeconds = 0.005f;   // soft edges on ranges and blobs (no clicks)
+    constexpr float edgeFadeSeconds = 0.005f;   // soft edges on ranges and spots (no clicks)
 
-    /** Total dB at a timeline position (ranges + envelope + blobs), with soft edges. */
+    /** Total dB at a timeline position (ranges + envelope + spots), with soft edges. */
     float totalDbAt (const EditState& s, int64_t pos, double sampleRate);
     float rangeDbAt (const EditState& s, int64_t pos, double sampleRate);
     float envelopeDbAt (const EditState& s, int64_t pos);
-    float blobDbAt (const EditState& s, int64_t pos, double sampleRate);
+    float spotDbAt (const EditState& s, int64_t pos, double sampleRate);
 
     std::shared_ptr<GainMap> buildGainMap (const EditState& s, double sampleRate);
 
-    enum ResetWhat { resetEverything = 0, resetRanges, resetEnvelope, resetBlobs };
+    enum ResetWhat { resetEverything = 0, resetRanges, resetEnvelope, resetSpots };
 
     /** Returns the state with edits inside [a, b) removed, so that region plays as recorded. */
     EditState resetRegion (const EditState& s, int64_t a, int64_t b, ResetWhat what, double sampleRate);
     EditState resetAll (const EditState& s);
 
+    /** Index of the spot with exactly this region (and kind), or -1. */
+    int findSpot (const EditState& s, int64_t start, int64_t end, int kind);
+    /** Index of the spot with this region, adding a 0 dB one if missing. */
+    int ensureSpot (EditState& s, int64_t start, int64_t end, int kind);
+    /** Drops spots whose gain is 0 dB (they do nothing). */
+    void pruneSpots (EditState& s);
+
     void sortEnvelope (EditState& s);
-    void sortBlobs (EditState& s);
+    void sortSpots (EditState& s);
 }

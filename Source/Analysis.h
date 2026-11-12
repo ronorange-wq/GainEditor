@@ -5,17 +5,40 @@
 
 namespace Analysis
 {
+    /** A detected blob (word, syllable, peak...). Just a region: gains live in SpotEdit. */
+    struct Segment
+    {
+        int64_t start = 0, end = 0;
+    };
+
     /**
         Finds blobs in [start, end) of the captured audio.
         resolution: 0 = whole phrases ... 1 = every single peak.
     */
-    std::vector<Blob> detectBlobs (const CaptureStore& audio, int64_t start, int64_t end, float resolution);
+    std::vector<Segment> detectBlobs (const CaptureStore& audio, int64_t start, int64_t end, float resolution);
 
-    /** Re-detects blobs in [start, end) (or everywhere if end <= start) and keeps gains the user already set. */
-    void redetect (EditState& state, const CaptureStore& audio, float resolution, int64_t start = 0, int64_t end = 0);
+    /** Blob size follows zoom: the closer you zoom in, the smaller the blobs (down to single peaks). */
+    float resolutionForZoom (double samplesPerPixel, double sampleRate);
 
-    /** Labels for the resolution slider. */
+    /** Name of a resolution: Phrase, Word, Syllable, Fine, Peak. */
     juce::String resolutionName (float resolution);
+
+    /** A peak of the edited audio that goes over the threshold. */
+    struct Peak
+    {
+        int64_t start = 0, end = 0;   // samples over the threshold
+        int64_t at = 0;               // position of the highest sample
+        float level = 0.0f;           // highest |sample| after the current edits (linear)
+    };
+
+    /** Peaks over thresholdGain in [start, end), measured on the audio with the current edits applied. */
+    std::vector<Peak> findPeaks (const CaptureStore& audio, const EditState& edits, int64_t start, int64_t end, float thresholdGain);
+
+    /** The region a peak spot covers (a little wider than the peak, for soft edges). */
+    void peakRegion (const Peak& p, double sampleRate, int64_t& a, int64_t& b);
+
+    /** Adds Peak spots that bring every peak in [start, end) down to the threshold. */
+    int tamePeaks (EditState& edits, const CaptureStore& audio, int64_t start, int64_t end, float thresholdGain);
 
     struct LoudnessStats
     {

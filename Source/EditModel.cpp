@@ -7,14 +7,14 @@ bool EditState::operator== (const EditState& o) const
 {
     auto sameRanges = ranges.size() == o.ranges.size()
         && std::equal (ranges.begin(), ranges.end(), o.ranges.begin(), [] (const RangeEdit& x, const RangeEdit& y)
-               { return x.start == y.start && x.end == y.end && x.db == y.db; });
+               { return x.start == y.start && x.end == y.end && juce::exactlyEqual (x.db, y.db); });
     auto sameEnv = envelope.size() == o.envelope.size()
         && std::equal (envelope.begin(), envelope.end(), o.envelope.begin(), [] (const EnvPoint& x, const EnvPoint& y)
-               { return x.pos == y.pos && x.db == y.db; });
-    auto sameBlobs = blobs.size() == o.blobs.size()
-        && std::equal (blobs.begin(), blobs.end(), o.blobs.begin(), [] (const Blob& x, const Blob& y)
-               { return x.start == y.start && x.end == y.end && x.db == y.db; });
-    return sameRanges && sameEnv && sameBlobs && blobResolution == o.blobResolution;
+               { return x.pos == y.pos && juce::exactlyEqual (x.db, y.db); });
+    auto sameSpots = spots.size() == o.spots.size()
+        && std::equal (spots.begin(), spots.end(), o.spots.begin(), [] (const SpotEdit& x, const SpotEdit& y)
+               { return x.start == y.start && x.end == y.end && juce::exactlyEqual (x.db, y.db) && x.kind == y.kind; });
+    return sameRanges && sameEnv && sameSpots;
 }
 
 namespace
@@ -39,14 +39,13 @@ namespace
 juce::ValueTree EditState::toValueTree() const
 {
     juce::ValueTree v ("EDITS");
-    v.setProperty ("blobResolution", blobResolution, nullptr);
-
+    v.setProperty ("format", 2, nullptr);
     v.setProperty ("ranges", encodeList (ranges, [] (juce::MemoryOutputStream& o, const RangeEdit& r)
                    { o.writeInt64 (r.start); o.writeInt64 (r.end); o.writeFloat (r.db); }), nullptr);
     v.setProperty ("envelope", encodeList (envelope, [] (juce::MemoryOutputStream& o, const EnvPoint& p)
                    { o.writeInt64 (p.pos); o.writeFloat (p.db); }), nullptr);
-    v.setProperty ("blobs", encodeList (blobs, [] (juce::MemoryOutputStream& o, const Blob& b)
-                   { o.writeInt64 (b.start); o.writeInt64 (b.end); o.writeFloat (b.db); }), nullptr);
+    v.setProperty ("spots", encodeList (spots, [] (juce::MemoryOutputStream& o, const SpotEdit& b)
+                   { o.writeInt64 (b.start); o.writeInt64 (b.end); o.writeFloat (b.db); o.writeByte ((char) b.kind); }), nullptr);
     return v;
 }
 
@@ -55,8 +54,6 @@ EditState EditState::fromValueTree (const juce::ValueTree& v)
     EditState s;
     if (! v.hasType ("EDITS"))
         return s;
-
-    s.blobResolution = (float) v.getProperty ("blobResolution", 0.6f);
 
     {
         auto mb = decode (v.getProperty ("ranges").toString());
@@ -78,18 +75,33 @@ EditState EditState::fromValueTree (const juce::ValueTree& v)
             s.envelope.push_back (p);
         }
     }
+    if (v.hasProperty ("spots"))
     {
+        auto mb = decode (v.getProperty ("spots").toString());
+        juce::MemoryInputStream in (mb, false);
+        while (in.getNumBytesRemaining() >= 21)
+        {
+            SpotEdit b;
+            b.start = in.readInt64(); b.end = in.readInt64(); b.db = in.readFloat(); b.kind = (int) in.readByte();
+            s.spots.push_back (b);
+        }
+    }
+    else if (v.hasProperty ("blobs"))
+    {
+        // version 1.0 / 1.1: blobs that had a gain become locked spots
         auto mb = decode (v.getProperty ("blobs").toString());
         juce::MemoryInputStream in (mb, false);
         while (in.getNumBytesRemaining() >= 20)
         {
-            Blob b;
+            SpotEdit b;
             b.start = in.readInt64(); b.end = in.readInt64(); b.db = in.readFloat();
-            s.blobs.push_back (b);
+            if (std::abs (b.db) > 0.0001f)
+                s.spots.push_back (b);
         }
     }
+
     EditOps::sortEnvelope (s);
-    EditOps::sortBlobs (s);
+    EditOps::sortSpots (s);
     return s;
 }
 
@@ -125,14 +137,11 @@ namespace EditOps
         if (fade < 1.0)
             return 1.0f;
 
-        const auto fromStart = (double) (pos - start);
-        const auto toEnd = (double) (end - 1 - pos);
-        const auto d = juce::jmin (fromStart, toEnd);
+        const auto d = juce::jmin ((double) (pos - start), (double) (end - 1 - pos));
         if (d >= fade)
             return 1.0f;
 
-        const auto t = d / fade;                         // 0..1
-        return (float) (0.5 - 0.5 * std::cos (t * juce::MathConstants<double>::pi));
+        return (float) (0.5 - 0.5 * std::cos (d / fade * juce::MathConstants<double>::pi));
     }
 
     float rangeDbAt (const EditState& s, int64_t pos, double sr)
@@ -163,21 +172,21 @@ namespace EditOps
         return a.db + (b.db - a.db) * t;
     }
 
-    float blobDbAt (const EditState& s, int64_t pos, double sr)
+    float spotDbAt (const EditState& s, int64_t pos, double sr)
     {
-        const auto& bl = s.blobs;
-        auto it = std::upper_bound (bl.begin(), bl.end(), pos, [] (int64_t p, const Blob& b) { return p < b.start; });
-        if (it == bl.begin())
-            return 0.0f;
-        const auto& b = *(it - 1);
-        if (pos >= b.end || b.db == 0.0f)
-            return 0.0f;
-        return b.db * edgeWeight (pos, b.start, b.end, sr);
+        float db = 0.0f;
+        for (auto& b : s.spots)
+        {
+            if (b.start > pos) break;          // sorted by start
+            if (pos < b.end)
+                db += b.db * edgeWeight (pos, b.start, b.end, sr);
+        }
+        return db;
     }
 
     float totalDbAt (const EditState& s, int64_t pos, double sr)
     {
-        return rangeDbAt (s, pos, sr) + envelopeDbAt (s, pos) + blobDbAt (s, pos, sr);
+        return rangeDbAt (s, pos, sr) + envelopeDbAt (s, pos) + spotDbAt (s, pos, sr);
     }
 
     std::shared_ptr<GainMap> buildGainMap (const EditState& s, double sr)
@@ -187,14 +196,12 @@ namespace EditOps
         int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
         auto extend = [&] (int64_t a, int64_t b) { lo = juce::jmin (lo, a); hi = juce::jmax (hi, b); };
 
-        for (auto& r : s.ranges)   if (r.db != 0.0f) extend (r.start, r.end);
-        for (auto& b : s.blobs)    if (b.db != 0.0f) extend (b.start, b.end);
+        for (auto& r : s.ranges)   if (std::abs (r.db) > 0.0f) extend (r.start, r.end);
+        for (auto& b : s.spots)    if (std::abs (b.db) > 0.0f) extend (b.start, b.end);
         for (auto& p : s.envelope) extend (p.pos, p.pos + 1);
 
-        const auto envBefore = juce::Decibels::decibelsToGain (envelopeDbAt (s, std::numeric_limits<int64_t>::min() / 2));
-        const auto envAfter  = juce::Decibels::decibelsToGain (envelopeDbAt (s, std::numeric_limits<int64_t>::max() / 2));
-        map->before = envBefore;
-        map->after = envAfter;
+        map->before = juce::Decibels::decibelsToGain (envelopeDbAt (s, std::numeric_limits<int64_t>::min() / 2));
+        map->after  = juce::Decibels::decibelsToGain (envelopeDbAt (s, std::numeric_limits<int64_t>::max() / 2));
 
         if (hi <= lo)
             return map;
@@ -204,12 +211,28 @@ namespace EditOps
         map->origin = lo;
 
         const auto n = (size_t) ((hi - lo) / GainMap::hop + 1);
+        std::vector<float> db (n, 0.0f);
+
+        // envelope: walk the points once
+        if (! s.envelope.empty())
+            for (size_t i = 0; i < n; ++i)
+                db[i] = envelopeDbAt (s, lo + (int64_t) i * GainMap::hop);
+
+        // ranges and spots: add each one over its own span only
+        auto addRegion = [&] (int64_t a, int64_t b, float value)
+        {
+            if (std::abs (value) <= 0.0f) return;
+            const auto i0 = (size_t) juce::jmax ((int64_t) 0, (a - lo) / GainMap::hop);
+            const auto i1 = (size_t) juce::jmin ((int64_t) n - 1, (b - lo) / GainMap::hop + 1);
+            for (auto i = i0; i <= i1; ++i)
+                db[i] += value * edgeWeight (lo + (int64_t) i * GainMap::hop, a, b, sr);
+        };
+        for (auto& r : s.ranges) addRegion (r.start, r.end, r.db);
+        for (auto& b : s.spots)  addRegion (b.start, b.end, b.db);
+
         map->gains.resize (n);
         for (size_t i = 0; i < n; ++i)
-        {
-            const auto pos = lo + (int64_t) i * GainMap::hop;
-            map->gains[i] = juce::Decibels::decibelsToGain (totalDbAt (s, pos, sr), -120.0f);
-        }
+            map->gains[i] = juce::Decibels::decibelsToGain (db[i], -120.0f);
         return map;
     }
 
@@ -218,9 +241,35 @@ namespace EditOps
         std::stable_sort (s.envelope.begin(), s.envelope.end(), [] (auto& a, auto& b) { return a.pos < b.pos; });
     }
 
-    void sortBlobs (EditState& s)
+    void sortSpots (EditState& s)
     {
-        std::sort (s.blobs.begin(), s.blobs.end(), [] (auto& a, auto& b) { return a.start < b.start; });
+        std::stable_sort (s.spots.begin(), s.spots.end(), [] (auto& a, auto& b)
+                          { return a.start != b.start ? a.start < b.start : a.end > b.end; });
+    }
+
+    int findSpot (const EditState& s, int64_t start, int64_t end, int kind)
+    {
+        for (int i = 0; i < (int) s.spots.size(); ++i)
+            if (s.spots[(size_t) i].sameRegion (start, end) && s.spots[(size_t) i].kind == kind)
+                return i;
+        return -1;
+    }
+
+    int ensureSpot (EditState& s, int64_t start, int64_t end, int kind)
+    {
+        auto i = findSpot (s, start, end, kind);
+        if (i >= 0)
+            return i;
+        s.spots.push_back ({ start, end, 0.0f, kind });
+        sortSpots (s);
+        return findSpot (s, start, end, kind);
+    }
+
+    void pruneSpots (EditState& s)
+    {
+        s.spots.erase (std::remove_if (s.spots.begin(), s.spots.end(), [] (const SpotEdit& b)
+                                       { return std::abs (b.db) < 0.0005f || b.end <= b.start; }),
+                       s.spots.end());
     }
 
     EditState resetRegion (const EditState& in, int64_t a, int64_t b, ResetWhat what, double sr)
@@ -230,16 +279,26 @@ namespace EditOps
 
         EditState s = in;
 
-        if (what == resetEverything || what == resetRanges)
+        auto clip = [a, b] (auto& list)
         {
-            std::vector<RangeEdit> out;
-            for (auto& r : s.ranges)
+            using T = typename std::decay_t<decltype (list)>::value_type;
+            std::vector<T> out;
+            for (auto& r : list)
             {
                 if (r.end <= a || r.start >= b) { out.push_back (r); continue; }
-                if (r.start < a) out.push_back ({ r.start, a, r.db });
-                if (r.end > b)   out.push_back ({ b, r.end, r.db });
+                if (r.start < a) { T p = r; p.end = a;   out.push_back (p); }
+                if (r.end > b)   { T p = r; p.start = b; out.push_back (p); }
             }
-            s.ranges = std::move (out);
+            list = std::move (out);
+        };
+
+        if (what == resetEverything || what == resetRanges)
+            clip (s.ranges);
+
+        if (what == resetEverything || what == resetSpots)
+        {
+            clip (s.spots);
+            sortSpots (s);
         }
 
         if ((what == resetEverything || what == resetEnvelope) && ! s.envelope.empty())
@@ -261,24 +320,8 @@ namespace EditOps
             s.envelope = std::move (out);
             sortEnvelope (s);
 
-            // Drop points that no longer do anything (a flat 0 dB line).
-            bool allZero = std::all_of (s.envelope.begin(), s.envelope.end(), [] (auto& p) { return std::abs (p.db) < 0.001f; });
-            if (allZero)
+            if (std::all_of (s.envelope.begin(), s.envelope.end(), [] (auto& p) { return std::abs (p.db) < 0.001f; }))
                 s.envelope.clear();
-        }
-
-        if (what == resetEverything || what == resetBlobs)
-        {
-            std::vector<Blob> out;
-            for (auto& bl : s.blobs)
-            {
-                if (bl.end <= a || bl.start >= b || bl.db == 0.0f) { out.push_back (bl); continue; }
-                if (bl.start < a) out.push_back ({ bl.start, a, bl.db });
-                out.push_back ({ juce::jmax (bl.start, a), juce::jmin (bl.end, b), 0.0f });
-                if (bl.end > b) out.push_back ({ b, bl.end, bl.db });
-            }
-            s.blobs = std::move (out);
-            sortBlobs (s);
         }
 
         return s;
@@ -286,11 +329,7 @@ namespace EditOps
 
     EditState resetAll (const EditState& in)
     {
-        EditState s = in;
-        s.ranges.clear();
-        s.envelope.clear();
-        for (auto& b : s.blobs)
-            b.db = 0.0f;
-        return s;
+        juce::ignoreUnused (in);
+        return EditState{};
     }
 }

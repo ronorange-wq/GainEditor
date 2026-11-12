@@ -20,9 +20,9 @@ namespace Analysis
         return "Peak";
     }
 
-    std::vector<Blob> detectBlobs (const CaptureStore& audio, int64_t start, int64_t end, float resolution)
+    std::vector<Segment> detectBlobs (const CaptureStore& audio, int64_t start, int64_t end, float resolution)
     {
-        std::vector<Blob> result;
+        std::vector<Segment> result;
         if (end <= start)
             return result;
 
@@ -132,7 +132,7 @@ namespace Analysis
 
         for (auto& s : merged)
         {
-            Blob b;
+            Segment b;
             b.start = start + (int64_t) s.first * hop;
             b.end = juce::jmin (end, start + (int64_t) s.second * hop);
             if (b.end > b.start)
@@ -141,38 +141,89 @@ namespace Analysis
         return result;
     }
 
-    void redetect (EditState& state, const CaptureStore& audio, float resolution, int64_t start, int64_t end)
+    float resolutionForZoom (double spp, double sr)
     {
-        if (! audio.hasData())
-            return;
+        // aim for blobs about 36 px wide on screen
+        const auto targetMs = juce::jmax (1.0, 36.0 * spp / sr * 1000.0);
+        const auto r = std::log (400.0 / targetMs) / std::log (400.0);
+        return (float) juce::jlimit (0.0, 1.0, r);
+    }
 
-        if (end <= start)
+    std::vector<Peak> findPeaks (const CaptureStore& audio, const EditState& edits, int64_t start, int64_t end, float thr)
+    {
+        std::vector<Peak> out;
+        if (end <= start || ! audio.hasData())
+            return out;
+
+        start = juce::jmax (start, audio.getWrittenStart());
+        end = juce::jmin (end, audio.getWrittenEnd());
+        const auto sr = audio.getSampleRate();
+        const auto mergeGap = (int64_t) (sr * 0.025);   // one peak = one burst, not every wave cycle
+        auto map = EditOps::buildGainMap (edits, sr);
+
+        constexpr int block = 8192;
+        std::vector<float> buf (block);
+        Peak cur;
+        bool open = false;
+
+        for (auto p = start; p < end; p += block)
         {
-            start = audio.getWrittenStart();
-            end = audio.getWrittenEnd();
+            const auto n = (int) juce::jmin ((int64_t) block, end - p);
+            audio.read (p, buf.data(), n);
+            for (int k = 0; k < n; ++k)
+            {
+                const auto pos = p + k;
+                const auto v = std::abs (buf[(size_t) k] * map->gainAt (pos));
+                if (v <= thr)
+                    continue;
+
+                if (open && pos - cur.end <= mergeGap)
+                {
+                    cur.end = pos + 1;
+                    if (v > cur.level) { cur.level = v; cur.at = pos; }
+                }
+                else
+                {
+                    if (open) out.push_back (cur);
+                    cur = { pos, pos + 1, pos, v };
+                    open = true;
+                }
+            }
         }
+        if (open) out.push_back (cur);
+        return out;
+    }
 
-        const auto old = state.blobs;
-        auto fresh = detectBlobs (audio, start, end, resolution);
+    void peakRegion (const Peak& p, double sr, int64_t& a, int64_t& b)
+    {
+        const auto pad = (int64_t) (sr * (EditOps::edgeFadeSeconds + 0.002));
+        a = p.start - pad;
+        b = p.end + pad;
+    }
 
-        // Keep the gain the user gave the old blob that sat under each new blob's middle.
-        for (auto& nb : fresh)
+    int tamePeaks (EditState& edits, const CaptureStore& audio, int64_t start, int64_t end, float thr)
+    {
+        const auto sr = audio.getSampleRate();
+        int count = 0;
+
+        // two passes: overlapping soft edges can leave a peak a hair over the line
+        for (int pass = 0; pass < 3; ++pass)
         {
-            const auto mid = (nb.start + nb.end) / 2;
-            for (auto& ob : old)
-                if (mid >= ob.start && mid < ob.end) { nb.db = ob.db; break; }
-        }
+            auto peaks = findPeaks (audio, edits, start, end, thr * 1.0005f);
+            if (peaks.empty())
+                break;
 
-        std::vector<Blob> out;
-        for (auto& ob : old)
-        {
-            if (ob.end <= start || ob.start >= end) { out.push_back (ob); continue; }
-            if (ob.start < start) out.push_back ({ ob.start, start, ob.db });
-            if (ob.end > end)     out.push_back ({ end, ob.end, ob.db });
+            for (auto& pk : peaks)
+            {
+                int64_t a, b;
+                peakRegion (pk, sr, a, b);
+                const auto idx = EditOps::ensureSpot (edits, a, b, SpotEdit::peak);
+                const auto needed = juce::Decibels::gainToDecibels (thr / pk.level) - 0.05f;
+                edits.spots[(size_t) idx].db += needed;
+                if (pass == 0) ++count;
+            }
         }
-        out.insert (out.end(), fresh.begin(), fresh.end());
-        state.blobs = std::move (out);
-        EditOps::sortBlobs (state);
+        return count;
     }
 
     //==========================================================================
