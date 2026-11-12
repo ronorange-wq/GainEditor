@@ -7,9 +7,13 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: installer
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-latest   # Apple Silicon
+    runs-on: macos-15-intel   # builds a Universal plugin (Apple Silicon + Intel)
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +46,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # only the newest commit may replace the download
+          HEAD_SHA=$(git ls-remote "https://github.com/${{ github.repository }}" refs/heads/main | cut -f1)
+          if [ "$HEAD_SHA" != "${{ github.sha }}" ]; then echo "Newer commit exists, not publishing."; exit 0; fi
           gh release delete latest -y --cleanup-tag || true
           gh release create latest "Gain Editor Installer.pkg" \
             --title "Gain Editor - latest build" \
-            --notes "Download Gain Editor Installer.pkg, then right-click > Open to install (Audio Unit for Ableton, Apple Silicon + Intel)."
+            --notes "Download Gain Editor Installer.pkg, then open it (System Settings > Privacy & Security > Open Anyway if macOS asks). Audio Unit for Ableton, Apple Silicon + Intel."
