@@ -38,7 +38,7 @@ auval -v aufx Gedt Gned | tail -5
 
 # Also make a .pkg installer, to install on other Macs with a double-click.
 pkgbuild --component "$AU" --install-location "/Library/Audio/Plug-Ins/Components" \
-    --identifier com.gaineditor.plugin --version 1.2.0 "Gain Editor Installer.pkg" >/dev/null 2>&1 \
+    --identifier com.gaineditor.plugin --version 1.3.0 "Gain Editor Installer.pkg" >/dev/null 2>&1 \
     && echo "Also created: Gain Editor Installer.pkg (for other Macs)"
 
 echo ""

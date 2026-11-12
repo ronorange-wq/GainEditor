@@ -120,6 +120,13 @@ void GainEditorProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             playing = info->getIsPlaying() || info->getIsRecording();
             if (auto t = info->getTimeInSamples())
                 timelinePos = *t;
+            if (auto ppq = info->getPpqPosition())
+            {
+                refPpq = *ppq;
+                refSamples = info->getTimeInSamples().orFallback (timelinePos);
+            }
+            if (auto bpm = info->getBpm())
+                refBpm = *bpm;
             else if (auto s = info->getTimeInSeconds())
                 timelinePos = (int64_t) std::llround (*s * currentSampleRate);
             else
@@ -277,6 +284,16 @@ void GainEditorProcessor::setThresholdDb (float db)
     sendChangeMessage();
 }
 
+float GainEditorProcessor::getReductionDb() const
+{
+    return (float) uiState.getProperty ("reductionDb", 0.0f);
+}
+
+void GainEditorProcessor::setReductionDb (float db)
+{
+    uiState.setProperty ("reductionDb", juce::jlimit (-24.0f, 0.0f, db), nullptr);
+}
+
 bool GainEditorProcessor::isAbletonSync() const
 {
     return (bool) uiState.getProperty ("abletonSync", false);
@@ -287,19 +304,90 @@ void GainEditorProcessor::setAbletonSync (bool on)
     uiState.setProperty ("abletonSync", on, nullptr);
     if (on && midiOut == nullptr)
         midiOut = sharedMidiPort();
+    if (on)
+    {
+        juce::String where;
+        installRemoteScript (where);
+    }
     sendChangeMessage();
 }
 
-void GainEditorProcessor::sendTransport (bool play)
+void GainEditorProcessor::sendSysEx (const juce::uint8* data, int size)
 {
     if (midiOut == nullptr)
         midiOut = sharedMidiPort();
-    if (midiOut == nullptr)
-        return;
+    if (midiOut != nullptr)
+        midiOut->sendMessageNow (juce::MidiMessage::createSysExMessage (data, size));
+}
 
-    const int note = play ? 60 : 61;
-    midiOut->sendMessageNow (juce::MidiMessage::noteOn (16, note, (juce::uint8) 127));
-    midiOut->sendMessageNow (juce::MidiMessage::noteOff (16, note));
+// SysEx: F0 7D 47 45 <cmd> [5 x 7-bit beats*1000] F7   (7D = non-commercial id, "GE")
+void GainEditorProcessor::sendPlayFrom (int64_t pos)
+{
+    const auto sr = capture.getSampleRate();
+    const auto beats = juce::jmax (0.0, refPpq.load() + (double) (pos - refSamples.load()) / sr * refBpm.load() / 60.0);
+    auto v = (juce::uint64) std::llround (beats * 1000.0);
+    juce::uint8 msg[10] = { 0x7D, 0x47, 0x45, 0x01, 0, 0, 0, 0, 0 };
+    for (int i = 4; i >= 0; --i) { msg[4 + i] = (juce::uint8) (v & 0x7F); v >>= 7; }
+    sendSysEx (msg, 9);
+}
+
+void GainEditorProcessor::sendStop()
+{
+    const juce::uint8 msg[] = { 0x7D, 0x47, 0x45, 0x02 };
+    sendSysEx (msg, 4);
+}
+
+static const char* remoteScriptSource = R"PY(# Gain Editor control surface for Ableton Live.
+# Lets the Gain Editor plugin start Ableton from a position and stop it.
+# Installed automatically by the plugin. Select it in Settings > Link, Tempo & MIDI > Control Surface.
+from _Framework.ControlSurface import ControlSurface
+
+
+def create_instance(c_instance):
+    return GainEditor(c_instance)
+
+
+class GainEditor(ControlSurface):
+    def __init__(self, c_instance):
+        ControlSurface.__init__(self, c_instance)
+        self.log_message("Gain Editor control surface ready")
+
+    def handle_sysex(self, midi_bytes):
+        if len(midi_bytes) < 6 or midi_bytes[1] != 0x7D or midi_bytes[2] != 0x47 or midi_bytes[3] != 0x45:
+            return
+        cmd = midi_bytes[4]
+        song = self.song()
+        if cmd == 1 and len(midi_bytes) >= 11:
+            value = 0
+            for b in midi_bytes[5:10]:
+                value = (value << 7) | (b & 0x7F)
+            song.current_song_time = value / 1000.0
+            if not song.is_playing:
+                song.continue_playing()
+        elif cmd == 2:
+            song.stop_playing()
+
+    def disconnect(self):
+        ControlSurface.disconnect(self)
+)PY";
+
+bool GainEditorProcessor::installRemoteScript (juce::String& result)
+{
+    auto dir = juce::File::getSpecialLocation (juce::File::userMusicDirectory)
+                   .getChildFile ("Ableton").getChildFile ("User Library").getChildFile ("Remote Scripts").getChildFile ("GainEditor");
+    auto file = dir.getChildFile ("__init__.py");
+    if (file.existsAsFile() && file.loadFileAsString() == juce::String (remoteScriptSource))
+    {
+        result = dir.getFullPathName();
+        return true;
+    }
+    if (! dir.createDirectory() || ! file.replaceWithText (remoteScriptSource))
+    {
+        result = "Could not write " + file.getFullPathName();
+        return false;
+    }
+    result = dir.getFullPathName();
+    return true;
 }
 
 //==============================================================================

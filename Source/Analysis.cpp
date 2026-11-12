@@ -29,8 +29,9 @@ namespace Analysis
         const auto sr = audio.getSampleRate();
         const auto r = (double) juce::jlimit (0.0f, 1.0f, resolution);
 
-        // 1) Peak envelope with a 1 ms hop.
+        // 1) Peak envelope with a 1 ms hop, on a fixed grid so the same audio always gives the same blobs.
         const int hop = juce::jmax (1, (int) std::round (sr / 1000.0));
+        start -= ((start % hop) + hop) % hop;
         const auto numHops = (size_t) ((end - start + hop - 1) / hop);
         std::vector<float> env (numHops, 0.0f);
         {
@@ -199,6 +200,37 @@ namespace Analysis
         const auto pad = (int64_t) (sr * (EditOps::edgeFadeSeconds + 0.002));
         a = p.start - pad;
         b = p.end + pad;
+    }
+
+    void applyAutoReduction (EditState& edits, const CaptureStore& audio, float thr, float reductionDb)
+    {
+        edits.spots.erase (std::remove_if (edits.spots.begin(), edits.spots.end(),
+                                           [] (const SpotEdit& s) { return s.kind == SpotEdit::peakAuto; }),
+                           edits.spots.end());
+        if (std::abs (reductionDb) < 0.01f || ! audio.hasData())
+            return;
+
+        const auto sr = audio.getSampleRate();
+        auto peaks = findPeaks (audio, edits, audio.getWrittenStart(), audio.getWrittenEnd(), thr);
+        for (auto& pk : peaks)
+        {
+            int64_t a, b;
+            peakRegion (pk, sr, a, b);
+            const bool manual = std::any_of (edits.spots.begin(), edits.spots.end(), [&] (const SpotEdit& s)
+                                             { return s.kind == SpotEdit::peak && s.start < b && s.end > a; });
+            if (! manual)
+                edits.spots.push_back ({ a, b, reductionDb, SpotEdit::peakAuto });
+        }
+        EditOps::sortSpots (edits);
+    }
+
+    float levelAfterEdits (const CaptureStore& audio, const EditState& edits, int64_t a, int64_t b)
+    {
+        float m = 0.0f;
+        const auto sr = audio.getSampleRate();
+        for (auto p = a; p < b; ++p)
+            m = juce::jmax (m, std::abs (audio.get (p)) * juce::Decibels::decibelsToGain (EditOps::totalDbAt (edits, p, sr), -120.0f));
+        return m;
     }
 
     int tamePeaks (EditState& edits, const CaptureStore& audio, int64_t start, int64_t end, float thr)

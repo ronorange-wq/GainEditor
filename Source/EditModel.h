@@ -23,7 +23,7 @@ struct EnvPoint
 */
 struct SpotEdit
 {
-    enum Kind : int { blob = 0, peak = 1 };
+    enum Kind : int { blob = 0, peak = 1, peakAuto = 2 };   // peakAuto: made by the Reduction control
     int64_t start = 0, end = 0;
     float db = 0.0f;
     int kind = blob;

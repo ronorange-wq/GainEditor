@@ -23,19 +23,21 @@ private:
 //==============================================================================
 namespace Theme
 {
-    const juce::Colour bg        { 0xff0f1114 };
-    const juce::Colour bar       { 0xff14161a };
-    const juce::Colour button    { 0xff1c1f24 };
-    const juce::Colour buttonLine{ 0xff30353c };
-    const juce::Colour active    { 0xff1e4e8c };
-    const juce::Colour activeLine{ 0xff3b82f6 };
+    const juce::Colour bg        { 0xff171b21 };
+    const juce::Colour bar       { 0xff1a1e25 };
+    const juce::Colour button    { 0xff20252d };
+    const juce::Colour buttonLine{ 0xff353c47 };
+    const juce::Colour active    { 0xff23558f };
+    const juce::Colour activeLine{ 0xff5aaaff };
     const juce::Colour text      { 0xffe9ecef };
     const juce::Colour textDim   { 0xff9aa0a6 };
-    const juce::Colour waveBg    { 0xff05070b };
-    const juce::Colour grid      { 0xff121a26 };
-    const juce::Colour scaleBg   { 0xff0b0f15 };
-    const juce::Colour scaleText { 0xffa9b6c8 };
-    const juce::Colour wave      { 0xff0a84ff };
+    const juce::Colour waveBg    { 0xff1c2129 };
+    const juce::Colour grid      { 0xff262c35 };
+    const juce::Colour scaleBg   { 0xff1c2129 };
+    const juce::Colour scaleText { 0xffc3cad4 };
+    const juce::Colour wave      { 0xff5aaaff };
+    const juce::Colour selFill   { 0xff2e6fb8 };
+    const juce::Colour selLine   { 0xff6fb6ff };
     const juce::Colour spot      { 0xff5b8cff };
     const juce::Colour spotFill  { 0xff2f6bff };
     const juce::Colour over      { 0xffff6a3d };   // audio above the threshold
@@ -151,6 +153,8 @@ private:
     // blobs follow the zoom: detected for the visible area and cached
     void refreshSegments();
     const Analysis::Segment* segmentAt (int64_t pos) const;
+    /** What the Blob tool grabs at pos: an existing blob edit, or the detected blob. */
+    bool blobTargetAt (int64_t pos, int64_t& a, int64_t& b, int& spotIndex) const;
     // peaks over the threshold in the visible area, cached
     void refreshVisiblePeaks();
     const Analysis::Peak* peakNear (int64_t pos) const;
@@ -184,10 +188,24 @@ private:
     int64_t hoverPos = -1;
 
     std::vector<Analysis::Peak> visiblePeaks;
+
+    struct Diamond
+    {
+        int64_t a = 0, b = 0;      // region of the peak's spot
+        int64_t at = 0;            // highest sample
+        float level = 0.0f;        // after edits (linear)
+        int spot = -1;             // index in spots, or -1 if the peak has no edit yet
+        bool over = true;          // still over the threshold
+    };
+    std::vector<Diamond> diamonds;
+    void refreshDiamonds();
+    bool diamondsDirty = true;
+    int diamondNear (juce::Point<float> p) const;
+    float dragStartLevel = 1.0f;
     bool peaksDirty = true;
     int peakCount = -1;
 
-    enum class Drag { none, newSelection, edgeA, edgeB, rangeGain, envPoint, spotGain, spotStart, spotEnd, ruler, threshold };
+    enum class Drag { none, newSelection, edgeA, edgeB, rangeGain, envPoint, spotGain, spotStart, spotEnd, ruler, threshold, diamond };
     Drag drag = Drag::none;
     int64_t dragAnchor = 0;
     float dragStartDb = 0.0f;

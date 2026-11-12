@@ -37,6 +37,15 @@ namespace Analysis
     /** The region a peak spot covers (a little wider than the peak, for soft edges). */
     void peakRegion (const Peak& p, double sampleRate, int64_t& a, int64_t& b);
 
+    /**
+        The Reduction control: every peak over the threshold gets an automatic spot of reductionDb.
+        Peaks you moved by hand (manual Peak spots) are left alone. reductionDb = 0 removes them all.
+    */
+    void applyAutoReduction (EditState& edits, const CaptureStore& audio, float thresholdGain, float reductionDb);
+
+    /** Highest |sample| after the edits in [a, b). */
+    float levelAfterEdits (const CaptureStore& audio, const EditState& edits, int64_t a, int64_t b);
+
     /** Adds Peak spots that bring every peak in [start, end) down to the threshold. */
     int tamePeaks (EditState& edits, const CaptureStore& audio, int64_t start, int64_t end, float thresholdGain);
 
@@ -46,6 +55,7 @@ namespace Analysis
         float truePeakDb = -150.0f;   // dBTP (4x oversampled)
         float rmsDb = -150.0f;        // dBFS
         float lufs = -150.0f;         // BS.1770 K-weighted loudness of the selection (ungated)
+        float crestDb() const { return peakDb > -149.0f && rmsDb > -149.0f ? peakDb - rmsDb : 0.0f; }
     };
 
     struct LoudnessReport

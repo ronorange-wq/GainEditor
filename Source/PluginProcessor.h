@@ -67,12 +67,19 @@ public:
     float getThresholdDb() const;
     void setThresholdDb (float db);
 
+    // ---- Reduction for all peaks over the threshold (dB, <= 0) ----
+    float getReductionDb() const;
+    void setReductionDb (float db);
+
     // ---- Ableton transport through a virtual MIDI port called "Gain Editor" ----
     bool isAbletonSync() const;
     void setAbletonSync (bool on);
     bool hasMidiPort() const noexcept { return midiOut != nullptr; }
-    /** Sends Play (note C4 / 60) or Stop (C#4 / 61) on MIDI channel 16. */
-    void sendTransport (bool play);
+    /** Asks Ableton (through the GainEditor control surface script) to play from a timeline position. */
+    void sendPlayFrom (int64_t timelinePos);
+    void sendStop();
+    /** Copies the GainEditor control surface script into Ableton's User Library. Returns true if it is there. */
+    bool installRemoteScript (juce::String& whereOrError);
 
     // Editor UI state kept with the project.
     juce::ValueTree uiState { "UI" };
@@ -98,6 +105,11 @@ private:
 
     // The recording is stored inside the Ableton project (FLAC), encoded once per change.
     std::shared_ptr<juce::MidiOutput> midiOut;
+    void sendSysEx (const juce::uint8* data, int size);
+
+    // last known link between samples and beats (from Ableton's play head)
+    std::atomic<double> refPpq { 0.0 }, refBpm { 120.0 };
+    std::atomic<int64_t> refSamples { 0 };
 
     juce::MemoryBlock encodedAudio;
     uint64_t encodedGeneration = std::numeric_limits<uint64_t>::max();

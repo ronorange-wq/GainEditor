@@ -149,7 +149,7 @@ void WaveformView::changeListenerCallback (juce::ChangeBroadcaster*)
         activeRange = -1;
     if (selectedPoint >= (int) proc.getEdits().envelope.size())
         selectedPoint = -1;
-    peaksDirty = true;
+    peaksDirty = true; diamondsDirty = true;
     peakCount = -1;
     updateBadge();
     repaint();
@@ -163,7 +163,7 @@ juce::Rectangle<int> WaveformView::waveArea() const
 void WaveformView::resized()
 {
     badge.setTopLeftPosition (waveArea().getX() + 10, waveArea().getY() + 10);
-    peaksDirty = true;
+    peaksDirty = true; diamondsDirty = true;
     updateBadge();
 }
 
@@ -243,7 +243,7 @@ void WaveformView::zoomVertical (float factor)
 void WaveformView::scrollTo (double startSample)
 {
     viewStart = juce::jmax (-spp * 20.0, startSample);
-    peaksDirty = true;
+    peaksDirty = true; diamondsDirty = true;
     changed();
 }
 
@@ -272,19 +272,46 @@ void WaveformView::refreshSegments()
         return;
     }
 
-    auto r = std::round (currentResolution() * 40.0f) / 40.0f;   // re-detect only when the zoom really changed
-    const auto visA = (int64_t) viewStart, visB = (int64_t) getViewEnd();
+    // Detect over the whole take (cached per zoom step) so a blob is always the same blob.
+    auto r = std::round (currentResolution() * 40.0f) / 40.0f;
     const auto gen = cap.getGeneration();
-
-    if (std::abs (r - segRes) < 0.001f && visA >= segA && visB <= segB && gen == segGeneration)
+    if (std::abs (r - segRes) < 0.001f && gen == segGeneration && ! segments.empty())
         return;
 
-    const auto span = visB - visA;
-    segA = juce::jmax (cap.getWrittenStart(), visA - span);
-    segB = juce::jmin (cap.getWrittenEnd(), visB + span);
+    segA = cap.getWrittenStart();
+    segB = cap.getWrittenEnd();
     segRes = r;
     segGeneration = gen;
-    segments = segB > segA ? Analysis::detectBlobs (cap, segA, segB, r) : std::vector<Analysis::Segment>();
+    segments = Analysis::detectBlobs (cap, segA, segB, r);
+}
+
+bool WaveformView::blobTargetAt (int64_t pos, int64_t& a, int64_t& b, int& spotIndex) const
+{
+    spotIndex = -1;
+    const auto* sg = segmentAt (pos);
+    const auto segLen = sg != nullptr ? sg->end - sg->start : (int64_t) 0;
+
+    // An existing blob edit under the mouse wins, unless you zoomed in far enough that blobs are much smaller now.
+    const auto& sp = proc.getEdits().spots;
+    int64_t bestLen = std::numeric_limits<int64_t>::max();
+    for (int k = 0; k < (int) sp.size(); ++k)
+    {
+        const auto& s = sp[(size_t) k];
+        if (s.kind != SpotEdit::blob || pos < s.start || pos >= s.end) continue;
+        const auto len = s.end - s.start;
+        if ((sg == nullptr || len <= segLen * 5 / 2) && len < bestLen) { bestLen = len; spotIndex = k; }
+    }
+    if (spotIndex >= 0)
+    {
+        a = sp[(size_t) spotIndex].start;
+        b = sp[(size_t) spotIndex].end;
+        return true;
+    }
+    if (sg == nullptr)
+        return false;
+    a = sg->start;
+    b = sg->end;
+    return true;
 }
 
 const Analysis::Segment* WaveformView::segmentAt (int64_t pos) const
@@ -302,6 +329,7 @@ void WaveformView::refreshVisiblePeaks()
     if (! peaksDirty)
         return;
     peaksDirty = false;
+    diamondsDirty = true;
     const auto margin = (int64_t) (spp * 20.0);
     visiblePeaks = Analysis::findPeaks (proc.getCapture(), proc.getEdits(),
                                         (int64_t) viewStart - margin, (int64_t) getViewEnd() + margin, thresholdGain());
@@ -619,7 +647,8 @@ void WaveformView::updateBadge()
     }
 
     badge.setInfo (what, db);
-    badge.setVisible (show);
+    badge.setVisible (false);
+    juce::ignoreUnused (show);
 }
 
 //==============================================================================
@@ -634,19 +663,12 @@ void WaveformView::paint (juce::Graphics& g)
     g.fillRect (area);
     paintGrid (g, area);
 
-    // range selection
-    if (hasSelection())
-    {
-        const auto x0 = posToX ((double) selA), x1 = posToX ((double) selB);
-        g.setColour (juce::Colours::white.withAlpha (0.08f));
-        g.fillRect (juce::Rectangle<float> (x0, (float) area.getY(), x1 - x0, (float) area.getHeight()));
-    }
-
     // hovered blob
-    if (tool == Tool::blob && hoverPos >= 0 && drag == Drag::none)
-        if (auto* sg = segmentAt (hoverPos))
+    int64_t ha = 0, hb = 0;
+    int hs = -1;
+    if (tool == Tool::blob && hoverPos >= 0 && drag == Drag::none && blobTargetAt (hoverPos, ha, hb, hs))
         {
-            const auto x0 = posToX ((double) sg->start), x1 = posToX ((double) sg->end);
+            const auto x0 = posToX ((double) ha), x1 = posToX ((double) hb);
             juce::Rectangle<float> r (x0, (float) area.getY(), x1 - x0, (float) area.getHeight());
             g.setColour (juce::Colours::white.withAlpha (0.07f));
             g.fillRect (r);
@@ -658,16 +680,35 @@ void WaveformView::paint (juce::Graphics& g)
         juce::Graphics::ScopedSaveState ss (g);
         g.reduceClipRegion (area);
         paintWave (g, area);
-        paintThreshold (g, area);
         if (tool == Tool::blob || tool == Tool::peak || tool == Tool::select)
             paintSpots (g, area);
+        paintThreshold (g, area);   // diamonds on top
         if (tool == Tool::envelope || ! proc.getEdits().envelope.empty())
             paintEnvelope (g, area);
 
         if (hasSelection())
         {
             const auto x0 = posToX ((double) selA), x1 = posToX ((double) selB);
-            g.setColour (juce::Colours::white.withAlpha (0.7f));
+            juce::Rectangle<float> r (x0, (float) area.getY() + 14.0f, juce::jmax (2.0f, x1 - x0), (float) area.getHeight() - 28.0f);
+            g.setColour (Theme::selFill.withAlpha (0.28f));
+            g.fillRoundedRectangle (r, 7.0f);
+            g.setColour (Theme::selLine);
+            g.drawRoundedRectangle (r, 7.0f, 1.6f);
+            const auto db = (activeRange >= 0 && activeRange < (int) proc.getEdits().ranges.size()) ? proc.getEdits().ranges[(size_t) activeRange].db : 0.0f;
+            const auto visible = r.getIntersection (area.toFloat());
+            if (visible.getWidth() > 46.0f)
+            {
+                const auto w = juce::jmin (96.0f, visible.getWidth() - 10.0f);
+                juce::Rectangle<float> pill (visible.getCentreX() - w * 0.5f, r.getY() + 10.0f, w, 26.0f);
+                g.setColour (juce::Colour (0xf0213a5c));
+                g.fillRoundedRectangle (pill, 6.0f);
+                g.setColour (Theme::selLine);
+                g.drawRoundedRectangle (pill, 6.0f, 1.0f);
+                g.setColour (juce::Colours::white);
+                g.setFont (juce::FontOptions (14.0f, juce::Font::bold));
+                g.drawText (dbText (db, 1), pill, juce::Justification::centred);
+            }
+            g.setColour (juce::Colours::white.withAlpha (0.0f));
             g.fillRect (juce::Rectangle<float> (x0 - 0.75f, (float) area.getY(), 1.5f, (float) area.getHeight()));
             g.fillRect (juce::Rectangle<float> (x1 - 0.75f, (float) area.getY(), 1.5f, (float) area.getHeight()));
             for (auto x : { x0, x1 })
@@ -787,7 +828,6 @@ void WaveformView::paintScale (juce::Graphics& g, juce::Rectangle<int> r, bool l
     {
         const auto yUp = ampToY (juce::Decibels::decibelsToGain (db), true);
         if (yUp < r.getY() + 4 || yUp - lastY < 22.0f || waveArea().getCentreY() - yUp < 24.0f) continue;
-        if (std::abs (db - thrDb) < 0.01f) continue;   // the threshold label goes there instead
         lastY = yUp;
         for (auto y : { yUp, ampToY (juce::Decibels::decibelsToGain (db), false) })
         {
@@ -803,17 +843,7 @@ void WaveformView::paintScale (juce::Graphics& g, juce::Rectangle<int> r, bool l
     g.drawText (juce::String (juce::CharPointer_UTF8 ("\xe2\x88\x92\xe2\x88\x9e")), r.withY ((int) waveArea().getCentreY() - 9).withHeight (18).reduced (8, 0),
                 left ? juce::Justification::centredRight : juce::Justification::centredLeft);
 
-    // threshold handles (drag them up / down)
-    for (auto upper : { true, false })
-    {
-        const auto y = ampToY (thresholdGain(), upper);
-        juce::Rectangle<float> h ((float) r.getX() + 3.0f, y - 10.0f, (float) r.getWidth() - 6.0f, 20.0f);
-        g.setColour (Theme::thresh);
-        g.fillRoundedRectangle (h, 5.0f);
-        g.setColour (juce::Colour (0xff14161a));
-        g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
-        g.drawText (label (std::round (thrDb)), h, juce::Justification::centred);
-    }
+    juce::ignoreUnused (thrDb);
 }
 
 void WaveformView::paintWave (juce::Graphics& g, juce::Rectangle<int> area)
@@ -868,51 +898,135 @@ void WaveformView::paintWave (juce::Graphics& g, juce::Rectangle<int> area)
 
     if (anyChange)
     {
-        g.setColour (Theme::wave.withAlpha (0.28f));
+        g.setColour (Theme::wave.withAlpha (0.25f));
         g.fillPath (original);
     }
 
     g.setColour (Theme::wave);
     g.fillPath (edited);
 
-    // everything over the threshold, in orange
-    const auto ty = ampToY (thresholdGain(), true), by = ampToY (thresholdGain(), false);
-    {
-        juce::Graphics::ScopedSaveState ss (g);
-        juce::RectangleList<int> over;
-        over.add (area.withBottom ((int) std::floor (ty)));
-        over.add (area.withTop ((int) std::ceil (by)));
-        g.reduceClipRegion (over);
-        g.setColour (Theme::over);
-        g.fillPath (edited);
-    }
+    juce::ignoreUnused (area);
 }
 
 void WaveformView::paintThreshold (juce::Graphics& g, juce::Rectangle<int> area)
 {
-    const auto alpha = tool == Tool::peak ? 0.95f : 0.5f;
-    float dashes[] = { 7.0f, 5.0f };
+    float dashes[] = { 6.0f, 5.0f };
     for (auto upper : { true, false })
     {
         const auto y = ampToY (thresholdGain(), upper);
-        g.setColour (Theme::thresh.withAlpha (alpha));
-        g.drawDashedLine (juce::Line<float> ((float) area.getX(), y, (float) area.getRight(), y), dashes, 2, 1.5f);
+        g.setColour (juce::Colours::white.withAlpha (tool == Tool::peak ? 0.85f : 0.6f));
+        g.drawDashedLine (juce::Line<float> ((float) area.getX(), y, (float) area.getRight(), y), dashes, 2, 1.3f);
     }
 
-    if (tool == Tool::peak)
+    refreshVisiblePeaks();
+
+    if (tool != Tool::peak)
     {
-        refreshVisiblePeaks();
-        g.setColour (Theme::over);
+        // small white markers over every peak above the line
+        g.setColour (juce::Colours::white.withAlpha (0.9f));
         for (auto& p : visiblePeaks)
         {
             const auto x = posToX ((double) p.at);
-            const auto y = ampToY (p.level, true) - 6.0f;
+            const auto y = juce::jmax ((float) area.getY() + 10.0f, ampToY (p.level, true) - 10.0f);
             juce::Path tri;
-            tri.addTriangle (x - 5.0f, juce::jmax ((float) area.getY() + 2.0f, y - 8.0f), x + 5.0f,
-                             juce::jmax ((float) area.getY() + 2.0f, y - 8.0f), x, juce::jmax ((float) area.getY() + 9.0f, y - 1.0f));
+            tri.addTriangle (x - 5.0f, y - 8.0f, x + 5.0f, y - 8.0f, x, y);
             g.fillPath (tri);
         }
+        return;
     }
+
+    // Peak tool: a diamond on top of every peak; drag it down to lower that peak
+    refreshDiamonds();
+    auto selIdx = selectedSpotIndices();
+    for (auto& d : diamonds)
+    {
+        const auto x = posToX ((double) d.at);
+        const auto y = juce::jmax ((float) area.getY() + 8.0f, ampToY (d.level, true));
+        const bool selected = d.spot >= 0 && std::binary_search (selIdx.begin(), selIdx.end(), d.spot);
+
+        juce::Path dia;
+        dia.addQuadrilateral (x, y - 7.0f, x + 7.0f, y, x, y + 7.0f, x - 7.0f, y);
+        g.setColour (selected ? Theme::wave : juce::Colours::white.withAlpha (d.over ? 1.0f : 0.45f));
+        g.fillPath (dia);
+        g.setColour (selected ? juce::Colours::white : juce::Colour (0xff1c2129));
+        g.strokePath (dia, juce::PathStrokeType (1.4f));
+
+        if (selected || (d.spot >= 0 && drag == Drag::diamond))
+        {
+            const auto db = proc.getEdits().spots[(size_t) d.spot].db;
+            juce::Rectangle<float> pill (x - 34.0f, y - 34.0f, 68.0f, 22.0f);
+            g.setColour (juce::Colour (0xf0151a21));
+            g.fillRoundedRectangle (pill, 6.0f);
+            g.setColour (Theme::selLine);
+            g.drawRoundedRectangle (pill, 6.0f, 1.0f);
+            g.setColour (juce::Colours::white);
+            g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
+            g.drawText (dbText (db, 1), pill, juce::Justification::centred);
+        }
+    }
+}
+
+void WaveformView::refreshDiamonds()
+{
+    if (! diamondsDirty)
+        return;
+    diamondsDirty = false;
+    diamonds.clear();
+
+    const auto& cap = proc.getCapture();
+    if (! cap.hasData())
+        return;
+
+    const auto& edits = proc.getEdits();
+    const auto sr = sampleRate();
+    const auto margin = (int64_t) (spp * 20.0);
+    const auto v0 = (int64_t) viewStart - margin, v1 = (int64_t) getViewEnd() + margin;
+    const auto thr = thresholdGain();
+
+    // peaks that already have an edit
+    for (int i = 0; i < (int) edits.spots.size(); ++i)
+    {
+        const auto& sp = edits.spots[(size_t) i];
+        if (sp.kind == SpotEdit::blob || sp.end < v0 || sp.start > v1)
+            continue;
+        Diamond d;
+        d.a = sp.start; d.b = sp.end; d.spot = i;
+        d.level = 0.0f; d.at = (sp.start + sp.end) / 2;
+        for (auto p = sp.start; p < sp.end; ++p)
+        {
+            const auto v = std::abs (cap.get (p)) * juce::Decibels::decibelsToGain (EditOps::totalDbAt (edits, p, sr), -120.0f);
+            if (v > d.level) { d.level = v; d.at = p; }
+        }
+        d.over = d.level > thr;
+        diamonds.push_back (d);
+    }
+
+    // peaks over the line that nobody touched yet
+    for (auto& pk : visiblePeaks)
+    {
+        int64_t a, b;
+        Analysis::peakRegion (pk, sr, a, b);
+        const bool covered = std::any_of (diamonds.begin(), diamonds.end(), [&] (const Diamond& d) { return d.a < b && d.b > a; });
+        if (covered)
+            continue;
+        Diamond d;
+        d.a = a; d.b = b; d.at = pk.at; d.level = pk.level; d.spot = -1; d.over = true;
+        diamonds.push_back (d);
+    }
+}
+
+int WaveformView::diamondNear (juce::Point<float> p) const
+{
+    int best = -1;
+    float bestDist = 14.0f;
+    for (int i = 0; i < (int) diamonds.size(); ++i)
+    {
+        const auto& d = diamonds[(size_t) i];
+        const juce::Point<float> c (posToX ((double) d.at), juce::jmax ((float) waveArea().getY() + 8.0f, ampToY (d.level, true)));
+        const auto dist = c.getDistanceFrom (p);
+        if (dist < bestDist) { bestDist = dist; best = i; }
+    }
+    return best;
 }
 
 void WaveformView::paintSpots (juce::Graphics& g, juce::Rectangle<int> area)
@@ -920,63 +1034,41 @@ void WaveformView::paintSpots (juce::Graphics& g, juce::Rectangle<int> area)
     const auto& sp = proc.getEdits().spots;
     const auto t0 = (int64_t) viewStart, t1 = (int64_t) getViewEnd();
     auto selIdx = selectedSpotIndices();
-    float dashes[] = { 6.0f, 4.0f };
 
     for (int i = 0; i < (int) sp.size(); ++i)
     {
         const auto& s = sp[(size_t) i];
-        if (s.end < t0 || s.start > t1) continue;
+        if (s.kind != SpotEdit::blob || s.end < t0 || s.start > t1) continue;   // peaks are shown as diamonds
         const bool selected = std::binary_search (selIdx.begin(), selIdx.end(), i);
         const auto x0 = posToX ((double) s.start), x1 = posToX ((double) s.end);
-        const auto inset = s.kind == SpotEdit::peak ? 14.0f : 6.0f;
-        juce::Rectangle<float> r (x0, (float) area.getY() + inset, juce::jmax (2.0f, x1 - x0), (float) area.getHeight() - inset * 2.0f);
+        juce::Rectangle<float> r (x0, (float) area.getY() + 14.0f, juce::jmax (2.0f, x1 - x0), (float) area.getHeight() - 28.0f);
 
-        juce::Path outline;
-        outline.addRoundedRectangle (r, 6.0f);
-        if (selected)
-        {
-            g.setColour (juce::Colours::white.withAlpha (0.06f));
-            g.fillRoundedRectangle (r, 6.0f);
-            g.setColour (juce::Colours::white);
-            g.strokePath (outline, juce::PathStrokeType (1.6f));
-        }
-        else
-        {
-            juce::Path dashed;
-            juce::PathStrokeType (1.6f).createDashedStroke (dashed, outline, dashes, 2);
-            g.setColour ((s.kind == SpotEdit::peak ? Theme::thresh : Theme::spot).withAlpha (0.85f));
-            g.fillPath (dashed);
-        }
+        g.setColour (Theme::selFill.withAlpha (selected ? 0.32f : 0.12f));
+        g.fillRoundedRectangle (r, 7.0f);
+        g.setColour (Theme::selLine.withAlpha (selected ? 1.0f : 0.4f));
+        g.drawRoundedRectangle (r, 7.0f, selected ? 1.6f : 1.0f);
 
-        // label with a small lock: this edit stays where it is when you zoom
-        const auto visibleW = juce::jmin (r.getRight(), (float) area.getRight()) - juce::jmax (r.getX(), (float) area.getX());
-        if (visibleW > 84.0f)
+        // "+3.0 dB" pill at the top of the blob
+        const auto visible = r.getIntersection (area.toFloat());
+        if (visible.getWidth() > 46.0f)
         {
-            // bottom-left of the visible part (the top corners hold the gain badge and the peak bar)
-            juce::Rectangle<float> tag (juce::jmax (r.getX(), (float) area.getX()) + 6.0f, r.getBottom() - 26.0f, 74.0f, 20.0f);
-            g.setColour (s.kind == SpotEdit::peak ? Theme::thresh : Theme::spotFill);
-            g.fillRoundedRectangle (tag, 5.0f);
-            const auto fg = s.kind == SpotEdit::peak ? juce::Colour (0xff14161a) : juce::Colours::white;
-            g.setColour (fg);
-            juce::Rectangle<float> body (tag.getX() + 7.0f, tag.getY() + 9.0f, 9.0f, 7.0f);
-            g.fillRoundedRectangle (body, 1.5f);
-            juce::Path shackle;
-            shackle.addCentredArc (body.getCentreX(), body.getY(), 3.0f, 3.5f, 0.0f, -juce::MathConstants<float>::halfPi,
-                                   juce::MathConstants<float>::halfPi, true);
-            g.strokePath (shackle, juce::PathStrokeType (1.5f));
-            g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
-            auto t = dbText (s.db, 1);
-            g.drawText (t.upToFirstOccurrenceOf (" dB", false, false), tag.withTrimmedLeft (20.0f), juce::Justification::centredLeft);
+            const auto w = juce::jmin (96.0f, visible.getWidth() - 10.0f);
+            juce::Rectangle<float> pill (visible.getCentreX() - w * 0.5f, r.getY() + 10.0f, w, 26.0f);
+            g.setColour (juce::Colour (selected ? 0xf0213a5c : 0xc8213a5c));
+            g.fillRoundedRectangle (pill, 6.0f);
+            g.setColour (Theme::selLine.withAlpha (selected ? 1.0f : 0.5f));
+            g.drawRoundedRectangle (pill, 6.0f, 1.0f);
+            g.setColour (juce::Colours::white.withAlpha (selected ? 1.0f : 0.8f));
+            g.setFont (juce::FontOptions (14.0f, juce::Font::bold));
+            g.drawText (dbText (s.db, 1), pill, juce::Justification::centred);
         }
 
         if (selected)
             for (auto x : { x0, x1 })
             {
-                juce::Rectangle<float> h (x - 5.0f, (float) area.getCentreY() - 5.0f, 10.0f, 10.0f);
+                juce::Rectangle<float> h (x - 4.0f, (float) area.getCentreY() - 9.0f, 8.0f, 18.0f);
                 g.setColour (juce::Colours::white);
-                g.fillRect (h);
-                g.setColour (Theme::spotFill);
-                g.drawRect (h, 2.0f);
+                g.fillRoundedRectangle (h, 3.0f);
             }
     }
 }
@@ -1061,10 +1153,12 @@ void WaveformView::mouseMove (const juce::MouseEvent& e)
     {
         refreshSegments();
         const auto newHover = (x >= area.getX() && x < area.getRight() && e.position.y >= rulerHeight) ? (int64_t) xToPos (x) : -1;
-        auto* before = hoverPos >= 0 ? segmentAt (hoverPos) : nullptr;
-        auto* after = newHover >= 0 ? segmentAt (newHover) : nullptr;
+        int64_t a0 = -1, b0 = -1, a1 = -1, b1 = -1;
+        int s0, s1;
+        if (hoverPos >= 0) blobTargetAt (hoverPos, a0, b0, s0);
+        if (newHover >= 0) blobTargetAt (newHover, a1, b1, s1);
         hoverPos = newHover;
-        if (before != after)
+        if (a0 != a1 || b0 != b1)
             repaint();
     }
 }
@@ -1194,16 +1288,20 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
             refreshSegments();
             selA = selB = 0;
             activeRange = -1;
-            auto* sg = segmentAt (pos);
-            if (sg == nullptr)
+            int64_t ba = 0, bb = 0;
+            int existing = -1;
+            if (! blobTargetAt (pos, ba, bb, existing))
             {
+                // not on a blob: move the play cursor here
                 if (! e.mods.isShiftDown()) selectedSpots.clear();
+                cursor = juce::jmax ((int64_t) 0, pos);
                 break;
             }
             proc.beginDrag();
             auto s = edits;
-            const auto i = EditOps::ensureSpot (s, sg->start, sg->end, SpotEdit::blob);
-            proc.setEdits (s, false);
+            const auto i = existing >= 0 ? existing : EditOps::ensureSpot (s, ba, bb, SpotEdit::blob);
+            if (existing < 0)
+                proc.setEdits (s, false);
             selectSpot (proc.getEdits().spots[(size_t) i], e.mods.isShiftDown() || e.mods.isCommandDown());
             startSpotDrag();
             break;
@@ -1214,29 +1312,38 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
             selA = selB = 0;
             activeRange = -1;
             refreshVisiblePeaks();
-            if (auto* pk = peakNear (pos))
+            refreshDiamonds();
+            const auto di = diamondNear (e.position);
+            if (di < 0)
             {
-                int64_t a, b;
-                Analysis::peakRegion (*pk, sampleRate(), a, b);
-                proc.beginDrag();
-                auto s = edits;
-                const auto i = EditOps::ensureSpot (s, a, b, SpotEdit::peak);
-                proc.setEdits (s, false);
-                selectSpot (proc.getEdits().spots[(size_t) i], e.mods.isShiftDown() || e.mods.isCommandDown());
-                startSpotDrag();
+                // empty spot: move the play cursor here
+                if (! e.mods.isShiftDown()) selectedSpots.clear();
+                cursor = juce::jmax ((int64_t) 0, pos);
                 break;
             }
-            // not on a peak: pick an existing peak spot under the mouse, if any
-            for (auto& sp : edits.spots)
-                if (sp.kind == SpotEdit::peak && pos >= sp.start && pos < sp.end)
-                {
-                    selectSpot (sp, e.mods.isShiftDown());
-                    proc.beginDrag();
-                    startSpotDrag();
-                    break;
-                }
-            if (drag == Drag::none && ! e.mods.isShiftDown())
-                selectedSpots.clear();
+
+            const auto d = diamonds[(size_t) di];
+            proc.beginDrag();
+            auto s = edits;
+            int idx;
+            if (d.spot >= 0 && d.spot < (int) s.spots.size())
+            {
+                idx = d.spot;
+                s.spots[(size_t) idx].kind = SpotEdit::peak;     // moved by hand: Reduction leaves it alone now
+            }
+            else
+            {
+                idx = EditOps::ensureSpot (s, d.a, d.b, SpotEdit::peak);
+            }
+            const auto key = s.spots[(size_t) idx];
+            proc.setEdits (s, false);
+            selectSpot (key, e.mods.isShiftDown() || e.mods.isCommandDown());
+            dragStartSpotDb.clear();
+            for (auto i : selectedSpotIndices())
+                dragStartSpotDb.push_back (proc.getEdits().spots[(size_t) i].db);
+            dragStartLevel = juce::jmax (1.0e-4f, d.level);
+            dragStartDb = key.db;
+            drag = Drag::diamond;
             break;
         }
 
@@ -1316,7 +1423,7 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
             auto db = juce::Decibels::gainToDecibels (amp);
             db = e.mods.isAltDown() ? std::round (db * 10.0f) / 10.0f : std::round (db * 2.0f) / 2.0f;
             proc.setThresholdDb (db);
-            peaksDirty = true;
+            peaksDirty = true; diamondsDirty = true;
             peakCount = -1;
             repaint();
             if (onStateChanged) onStateChanged();
@@ -1374,6 +1481,29 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
             break;
         }
 
+        case Drag::diamond:
+        {
+            // the diamond follows the mouse: work out how many dB that is for the dragged peak
+            float delta;
+            if (e.mods.isAltDown())
+                delta = dragDbAccum;                              // Option: 0.01 dB per pixel
+            else
+            {
+                const auto a = waveArea().toFloat();
+                const auto half = (a.getHeight() * 0.5f - 10.0f) * vZoom;
+                auto amp = juce::jlimit (0.0005f, 2.0f, (a.getCentreY() - e.position.y) / half);
+                if (std::abs (e.position.y - ampToY (thresholdGain(), true)) < 6.0f)
+                    amp = thresholdGain() * 0.999f;               // snap to the line
+                delta = juce::Decibels::gainToDecibels (amp / dragStartLevel);
+            }
+            auto idx = selectedSpotIndices();
+            for (size_t k = 0; k < idx.size() && k < dragStartSpotDb.size(); ++k)
+                s.spots[(size_t) idx[k]].db = juce::jlimit (-48.0f, 24.0f, dragStartSpotDb[k] + delta);
+            proc.setEdits (s, false);
+            diamondsDirty = true;
+            break;
+        }
+
         case Drag::spotStart:
         case Drag::spotEnd:
         {
@@ -1418,6 +1548,7 @@ void WaveformView::mouseUp (const juce::MouseEvent& e)
         case Drag::edgeB:     proc.commitDrag ("Resize Range"); break;
         case Drag::rangeGain: proc.commitDrag ("Range Gain"); break;
         case Drag::envPoint:  proc.commitDrag ("Envelope"); break;
+        case Drag::diamond:
         case Drag::spotGain:
         case Drag::spotStart:
         case Drag::spotEnd:
@@ -1425,7 +1556,8 @@ void WaveformView::mouseUp (const juce::MouseEvent& e)
             // a click that changed nothing leaves no empty 0 dB spot behind
             auto s = proc.getEdits();
             const auto before = s.spots.size();
-            EditOps::pruneSpots (s);
+            if (drag != Drag::diamond)   // a clicked peak stays selectable (arrow keys) even at 0 dB
+                EditOps::pruneSpots (s);
             if (s.spots.size() != before)
                 proc.setEdits (s, false);
             proc.commitDrag (tool == Tool::peak ? "Peak Gain" : "Blob Gain");
@@ -1447,7 +1579,7 @@ void WaveformView::mouseDoubleClick (const juce::MouseEvent& e)
     if (e.position.x < area.getX() || e.position.x >= area.getRight())
     {
         proc.setThresholdDb (-6.0f);   // double-click the scale: back to -6 dB
-        peaksDirty = true;
+        peaksDirty = true; diamondsDirty = true;
         peakCount = -1;
         changed();
         return;
