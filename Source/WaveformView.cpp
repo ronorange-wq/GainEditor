@@ -15,6 +15,7 @@ void PeakCache::update (const CaptureStore& audio, int64_t start, int64_t end)
     {
         mn.resize (neededBins, 0.0f);
         mx.resize (neededBins, 0.0f);
+        ms.resize (neededBins, 0.0f);
     }
 
     const auto firstBin = (size_t) juce::jmax ((int64_t) 0, start / binSize);
@@ -22,10 +23,11 @@ void PeakCache::update (const CaptureStore& audio, int64_t start, int64_t end)
     for (auto b = firstBin; b < neededBins; ++b)
     {
         audio.read ((int64_t) b * binSize, buf, binSize);
-        float lo = 0.0f, hi = 0.0f;
-        for (auto v : buf) { lo = juce::jmin (lo, v); hi = juce::jmax (hi, v); }
+        float lo = 0.0f, hi = 0.0f, sq = 0.0f;
+        for (auto v : buf) { lo = juce::jmin (lo, v); hi = juce::jmax (hi, v); sq += v * v; }
         mn[b] = lo;
         mx[b] = hi;
+        ms[b] = sq / (float) binSize;
     }
 }
 
@@ -53,6 +55,40 @@ void PeakCache::getRange (const CaptureStore& audio, int64_t s0, int64_t s1, flo
         lo = juce::jmin (lo, mn[b]);
         hi = juce::jmax (hi, mx[b]);
     }
+}
+
+void PeakCache::getRange (const CaptureStore& audio, int64_t s0, int64_t s1, float& lo, float& hi, float& rms) const
+{
+    lo = hi = rms = 0.0f;
+    if (s1 <= s0)
+        s1 = s0 + 1;
+
+    if (s1 - s0 < binSize * 2)
+    {
+        double sq = 0.0;
+        for (auto p = s0; p < s1; ++p)
+        {
+            const auto v = audio.get (p);
+            lo = juce::jmin (lo, v);
+            hi = juce::jmax (hi, v);
+            sq += (double) v * v;
+        }
+        rms = (float) std::sqrt (sq / (double) (s1 - s0));
+        return;
+    }
+
+    const auto b0 = (size_t) juce::jmax ((int64_t) 0, s0 / binSize);
+    const auto b1 = (size_t) juce::jmax ((int64_t) 0, (s1 - 1) / binSize);
+    double sq = 0.0;
+    size_t n = 0;
+    for (auto b = b0; b <= b1 && b < mn.size(); ++b)
+    {
+        lo = juce::jmin (lo, mn[b]);
+        hi = juce::jmax (hi, mx[b]);
+        sq += ms[b];
+        ++n;
+    }
+    rms = n > 0 ? (float) std::sqrt (sq / (double) n) : 0.0f;
 }
 
 //==============================================================================
@@ -858,53 +894,63 @@ void WaveformView::paintWave (juce::Graphics& g, juce::Rectangle<int> area)
     const auto step = 1.0f / scale;                      // draw at the screen's real resolution
     const auto wStart = cap.getWrittenStart(), wEnd = cap.getWrittenEnd();
 
-    juce::Path edited, original;
-    std::vector<juce::Point<float>> eTop, eBot, oTop, oBot;
+    // Two layers like a mastering editor: the peaks (fine, slightly see-through) and the RMS body (solid).
+    juce::Path edited, original, body;
+    std::vector<juce::Point<float>> eTop, eBot, oTop, oBot, rTop, rBot;
     bool anyChange = false;
 
+    auto closeShape = [] (juce::Path& path, std::vector<juce::Point<float>>& top, std::vector<juce::Point<float>>& bot)
+    {
+        if (top.size() > 1)
+        {
+            path.startNewSubPath (top.front());
+            for (size_t i = 1; i < top.size(); ++i) path.lineTo (top[i]);
+            for (auto it = bot.rbegin(); it != bot.rend(); ++it) path.lineTo (*it);
+            path.closeSubPath();
+        }
+        top.clear(); bot.clear();
+    };
     auto flush = [&]
     {
-        if (eTop.size() > 1)
-        {
-            edited.startNewSubPath (eTop.front());
-            for (size_t i = 1; i < eTop.size(); ++i) edited.lineTo (eTop[i]);
-            for (auto it = eBot.rbegin(); it != eBot.rend(); ++it) edited.lineTo (*it);
-            edited.closeSubPath();
-            original.startNewSubPath (oTop.front());
-            for (size_t i = 1; i < oTop.size(); ++i) original.lineTo (oTop[i]);
-            for (auto it = oBot.rbegin(); it != oBot.rend(); ++it) original.lineTo (*it);
-            original.closeSubPath();
-        }
-        eTop.clear(); eBot.clear(); oTop.clear(); oBot.clear();
+        closeShape (edited, eTop, eBot);
+        closeShape (original, oTop, oBot);
+        closeShape (body, rTop, rBot);
     };
 
+    const auto rmsScale = 1.41f;   // show the RMS body at the height of an equally loud sine wave
     for (float x = (float) area.getX(); x < (float) area.getRight(); x += step)
     {
         const auto s0 = (int64_t) std::floor (xToPos (x));
         const auto s1 = juce::jmax (s0 + 1, (int64_t) std::floor (xToPos (x + step)));
         if (s1 < wStart || s0 >= wEnd) { flush(); continue; }
 
-        float lo, hi;
-        peaks.getRange (cap, s0, s1, lo, hi);
+        float lo, hi, rms;
+        peaks.getRange (cap, s0, s1, lo, hi, rms);
         const auto gain = juce::Decibels::decibelsToGain (EditOps::totalDbAt (s, (s0 + s1) / 2, sr), -120.0f);
         if (std::abs (gain - 1.0f) > 0.006f) anyChange = true;
+
+        // when zoomed in to single samples there is no "body": the line itself is the wave
+        const auto r = (s1 - s0) >= 8 ? juce::jmin (rms * rmsScale, juce::jmax (hi, -lo)) : 0.0f;
 
         eTop.push_back ({ x, ampToY (hi * gain, true) });
         eBot.push_back ({ x, ampToY (-lo * gain, false) });
         oTop.push_back ({ x, ampToY (hi, true) });
         oBot.push_back ({ x, ampToY (-lo, false) });
+        rTop.push_back ({ x, ampToY (r * gain, true) });
+        rBot.push_back ({ x, ampToY (r * gain, false) });
     }
     flush();
 
     if (anyChange)
     {
-        g.setColour (Theme::wave.withAlpha (0.25f));
+        g.setColour (Theme::wave.withAlpha (0.18f));
         g.fillPath (original);
     }
 
-    g.setColour (Theme::wave);
+    g.setColour (Theme::wave.withAlpha (0.62f));
     g.fillPath (edited);
-
+    g.setColour (Theme::wave.brighter (0.12f));
+    g.fillPath (body);
     juce::ignoreUnused (area);
 }
 

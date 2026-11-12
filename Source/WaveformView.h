@@ -15,9 +15,11 @@ public:
 
     /** Min and max of the original audio over [s0, s1). */
     void getRange (const CaptureStore& audio, int64_t s0, int64_t s1, float& lo, float& hi) const;
+    /** Min, max and RMS of the original audio over [s0, s1). */
+    void getRange (const CaptureStore& audio, int64_t s0, int64_t s1, float& lo, float& hi, float& rms) const;
 
 private:
-    std::vector<float> mn, mx;
+    std::vector<float> mn, mx, ms;   // per bin: min, max, mean square
 };
 
 //==============================================================================
