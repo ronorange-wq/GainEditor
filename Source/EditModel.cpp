@@ -131,13 +131,13 @@ float GainMap::gainAt (int64_t pos) const noexcept
 //==============================================================================
 namespace EditOps
 {
-    static float edgeWeight (int64_t pos, int64_t start, int64_t end, double sampleRate)
+    static float edgeWeight (int64_t pos, int64_t start, int64_t end, double sampleRate, float fadeSeconds = edgeFadeSeconds)
     {
         if (pos < start || pos >= end)
             return 0.0f;
 
         const auto len = (double) (end - start);
-        const auto fade = juce::jmin ((double) edgeFadeSeconds * sampleRate, len * 0.5);
+        const auto fade = juce::jmin ((double) fadeSeconds * sampleRate, len * 0.5);
         if (fade < 1.0)
             return 1.0f;
 
@@ -153,7 +153,7 @@ namespace EditOps
         float db = 0.0f;
         for (auto& r : s.ranges)
             if (pos >= r.start && pos < r.end)
-                db += r.db * edgeWeight (pos, r.start, r.end, sr);
+                db += r.db * edgeWeight (pos, r.start, r.end, sr, rangeFadeSeconds);
         return db;
     }
 
@@ -241,18 +241,18 @@ namespace EditOps
                 db[i] = envelopeDbAt (s, lo + (int64_t) i * GainMap::hop);
 
         // ranges and spots: add each one over its own span only
-        auto addRegion = [&] (int64_t a, int64_t b, float value)
+        auto addRegion = [&] (int64_t a, int64_t b, float value, float fade)
         {
             if (std::abs (value) <= 0.0f) return;
             const auto i0 = (size_t) juce::jmax ((int64_t) 0, (a - lo) / GainMap::hop);
             const auto i1 = (size_t) juce::jmin ((int64_t) n - 1, (b - lo) / GainMap::hop + 1);
             for (auto i = i0; i <= i1; ++i)
-                db[i] += value * edgeWeight (lo + (int64_t) i * GainMap::hop, a, b, sr);
+                db[i] += value * edgeWeight (lo + (int64_t) i * GainMap::hop, a, b, sr, fade);
         };
-        for (auto& r : s.ranges) addRegion (r.start, r.end, r.db);
+        for (auto& r : s.ranges) addRegion (r.start, r.end, r.db, rangeFadeSeconds);
         for (auto& b : s.spots)
             if (! (s.sibFilter && SpotEdit::isSibilance (b.kind)))
-                addRegion (b.start, b.end, b.db);
+                addRegion (b.start, b.end, b.db, edgeFadeSeconds);
 
         map->gains.resize (n);
         for (size_t i = 0; i < n; ++i)

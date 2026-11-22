@@ -217,6 +217,7 @@ private:
     bool diamondsDirty = true;
     int diamondNear (juce::Point<float> p) const;
     float dragStartLevel = 1.0f;
+    float envDragStartX = 0.0f, envDragStartY = 0.0f;
     bool peaksDirty = true;
     int peakCount = -1;
 

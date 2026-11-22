@@ -68,7 +68,8 @@ struct GainMap
 
 namespace EditOps
 {
-    constexpr float edgeFadeSeconds = 0.005f;   // soft edges on ranges and spots (no clicks)
+    constexpr float edgeFadeSeconds = 0.010f;        // soft edges on blob edits
+    constexpr float rangeFadeSeconds = 0.020f;       // softer edges on Range edits (smooth in and out)
 
     /** Total dB at a timeline position (ranges + envelope + spots), with soft edges. */
     float totalDbAt (const EditState& s, int64_t pos, double sampleRate);

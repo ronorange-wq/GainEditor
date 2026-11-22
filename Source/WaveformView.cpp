@@ -293,7 +293,8 @@ void WaveformView::followPlayhead (int64_t pos)
 
 float WaveformView::currentResolution() const
 {
-    return Analysis::resolutionForZoom (spp, sampleRate());
+    // Blob size comes from the Blob Size slider (not the zoom)
+    return (float) proc.uiState.getProperty ("blobRes", 0.4f);
 }
 
 //==============================================================================
@@ -333,7 +334,7 @@ bool WaveformView::blobTargetAt (int64_t pos, int64_t& a, int64_t& b, int& spotI
     for (int k = 0; k < (int) sp.size(); ++k)
     {
         const auto& s = sp[(size_t) k];
-        if (s.kind != SpotEdit::blob || pos < s.start || pos >= s.end) continue;
+        if (pos < s.start || pos >= s.end) continue;
         const auto len = s.end - s.start;
         if ((sg == nullptr || len <= segLen * 5 / 2) && len < bestLen) { bestLen = len; spotIndex = k; }
     }
@@ -718,9 +719,8 @@ void WaveformView::paint (juce::Graphics& g)
         paintWave (g, area);
         if (showSibilance())
             paintSibilanceMarks (g, area);
-        if (tool == Tool::blob || tool == Tool::peak || tool == Tool::select)
+        if (tool == Tool::blob || tool == Tool::select)
             paintSpots (g, area);
-        paintThreshold (g, area);   // diamonds on top
         if (tool == Tool::envelope || ! proc.getEdits().envelope.empty())
             paintEnvelope (g, area);
 
@@ -1129,7 +1129,7 @@ void WaveformView::paintSpots (juce::Graphics& g, juce::Rectangle<int> area)
     for (int i = 0; i < (int) sp.size(); ++i)
     {
         const auto& s = sp[(size_t) i];
-        if (s.kind != SpotEdit::blob || s.end < t0 || s.start > t1) continue;   // peaks are shown as diamonds
+        if (s.end < t0 || s.start > t1) continue;
         const bool selected = std::binary_search (selIdx.begin(), selIdx.end(), i);
         const auto x0 = posToX ((double) s.start), x1 = posToX ((double) s.end);
         juce::Rectangle<float> r (x0, (float) area.getY() + 14.0f, juce::jmax (2.0f, x1 - x0), (float) area.getHeight() - 28.0f);
@@ -1208,7 +1208,7 @@ void WaveformView::paintEnvelope (juce::Graphics& g, juce::Rectangle<int> area)
 //==============================================================================
 bool WaveformView::showSibilance() const
 {
-    return tool == Tool::sibilance || (bool) proc.uiState.getProperty ("showSib", false);
+    return false;   // sibilance tools are not in this version
 }
 
 void WaveformView::refreshSibilance()
@@ -1431,7 +1431,7 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
             if (idx < 0)
             {
                 auto s = edits;
-                const auto db = yToDb (e.position.y);
+                const auto db = EditOps::envelopeDbAt (s, pos);   // on the line: adding a point changes nothing
                 if (s.envelope.empty())
                 {
                     const auto anchor = (int64_t) (sampleRate() * 0.15);
@@ -1445,6 +1445,13 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
                 proc.setEdits (s, false);
             }
             selectedPoint = idx;
+            if (idx >= 0)
+            {
+                dragStartDb = proc.getEdits().envelope[(size_t) idx].db;
+                dragAnchor = proc.getEdits().envelope[(size_t) idx].pos;
+            }
+            envDragStartY = e.position.y;
+            envDragStartX = e.position.x;
             drag = Drag::envPoint;
             break;
         }
@@ -1565,8 +1572,22 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
 
 void WaveformView::mouseDrag (const juce::MouseEvent& e)
 {
-    if (e.getDistanceFromDragStart() > 2)
+    // Gain only starts to move after the mouse has really moved (a click never changes the sound)
+    const bool gainDrag = drag == Drag::rangeGain || drag == Drag::spotGain || drag == Drag::envPoint;
+    if (! dragMoved)
+    {
+        if (e.getDistanceFromDragStart() <= 3)
+            return;
         dragMoved = true;
+        if (gainDrag)
+        {
+            lastDragY = e.position.y;
+            dragDbAccum = 0.0f;
+            envDragStartY = e.position.y;
+            envDragStartX = e.position.x;
+            return;
+        }
+    }
 
     const auto pos = (int64_t) xToPos (e.position.x);
     const auto dy = lastDragY - e.position.y;    // up = louder
@@ -1633,8 +1654,10 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
                     p.db = juce::jlimit (-36.0f, 12.0f, p.db + dy * 0.01f);   // fine: vertical only
                 else
                 {
-                    p.pos = juce::jlimit (lo, hi, pos);
-                    p.db = yToDb (e.position.y);
+                    // move by how far the mouse moved (no jump to where you clicked)
+                    const auto startX = posToX ((double) dragAnchor);
+                    p.pos = juce::jlimit (lo, hi, (int64_t) xToPos (startX + (e.position.x - envDragStartX)));
+                    p.db = yToDb (dbToY (dragStartDb) + (e.position.y - envDragStartY));
                 }
                 proc.setEdits (s, false);
             }

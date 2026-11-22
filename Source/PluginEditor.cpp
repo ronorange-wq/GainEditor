@@ -322,8 +322,21 @@ AnalysisPanel::AnalysisPanel()
     reductionSlider.setColour (juce::Slider::backgroundColourId, Theme::wave);
     reductionSlider.setColour (juce::Slider::thumbColourId, juce::Colours::white);
     reductionSlider.setTooltip ("Lower every peak over the threshold by this much. Peaks you dragged by hand keep their own value.");
-    addAndMakeVisible (reductionSlider);
+    addChildComponent (reductionSlider);
+    threshold.setVisible (false);
+    reduction.setVisible (false);
+    addChildComponent (threshold);
+    addChildComponent (reduction);
     threshold.setTooltip ("Peaks over this level get a diamond in the Peak tool");
+
+    blobSize.setSliderStyle (juce::Slider::LinearHorizontal);
+    blobSize.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+    blobSize.setRange (0.0, 1.0, 0.0);
+    blobSize.setColour (juce::Slider::trackColourId, Theme::wave);
+    blobSize.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff3a414c));
+    blobSize.setColour (juce::Slider::thumbColourId, juce::Colours::white);
+    blobSize.setTooltip ("Blob size: left = whole phrases, right = single peaks. Edits you already made never change.");
+    addAndMakeVisible (blobSize);
 
     auto styleSlider = [] (juce::Slider& sl, double lo, double hi, double step)
     {
@@ -365,7 +378,8 @@ void AnalysisPanel::setSibilanceMode (bool sib)
     if (sib == sibMode && getNumChildComponents() > 0 && threshold.isVisible() != sib) return;
     sibMode = sib;
     for (juce::Component* c : { (juce::Component*) &threshold, (juce::Component*) &reduction, (juce::Component*) &reductionSlider })
-        c->setVisible (! sib);
+        c->setVisible (false);
+    blobSize.setVisible (! sib);
     for (juce::Component* c : { (juce::Component*) &sensitivity, (juce::Component*) &sensitivitySlider, (juce::Component*) &sibReduction,
                                 (juce::Component*) &sibReductionSlider, (juce::Component*) &volumeMode, (juce::Component*) &filterMode, (juce::Component*) &frequency })
         c->setVisible (sib);
@@ -435,16 +449,37 @@ void AnalysisPanel::paint (juce::Graphics& g)
     g.fillRect (0, 0, 1, getHeight());
 
     auto r = getLocalBounds().reduced (22, 18);
-    g.setColour (Theme::text);
-    g.setFont (juce::FontOptions (20.0f));
-    g.drawText ("Threshold", r.removeFromTop (30), juce::Justification::centredLeft);
-    r.removeFromTop (62);
-    g.setColour (Theme::buttonLine);
-    g.fillRect (r.removeFromTop (1));
-    r.removeFromTop (14);
-    g.setColour (Theme::text);
-    g.drawText ("Reduction", r.removeFromTop (30), juce::Justification::centredLeft);
-    r.removeFromTop (100);
+    {
+        auto titleRow = r.removeFromTop (30);
+        g.setColour (Theme::text);
+        g.setFont (juce::FontOptions (20.0f));
+        g.drawText ("Blob Size", titleRow, juce::Justification::centredLeft);
+        g.setColour (Theme::wave);
+        g.setFont (juce::FontOptions (17.0f, juce::Font::bold));
+        g.drawText (blobSizeName, titleRow, juce::Justification::centredRight);
+    }
+    r.removeFromTop (8 + 30);
+    {
+        auto labels = r.removeFromTop (18);
+        g.setColour (Theme::textDim);
+        g.setFont (juce::FontOptions (12.0f));
+        const char* names[] = { "Phrase", "Word", "Syllable", "Peak" };
+        for (int i = 0; i < 4; ++i)
+        {
+            const auto cx = labels.getX() + 10 + (int) ((labels.getWidth() - 20) * (i / 3.0f));
+            auto box = juce::Rectangle<int> (cx - 30, labels.getY(), 60, labels.getHeight());
+            if (i == 0) box.setX (labels.getX());
+            if (i == 3) box.setX (labels.getRight() - 60);
+            g.drawText (names[i], box,
+                        i == 0 ? juce::Justification::centredLeft : (i == 3 ? juce::Justification::centredRight : juce::Justification::centred));
+        }
+    }
+    r.removeFromTop (8);
+    g.setColour (Theme::textDim);
+    g.setFont (juce::FontOptions (12.5f));
+    g.drawFittedText ("Moving this only changes what the next click grabs. Edits you made stay as they are.",
+                      r.removeFromTop (36), juce::Justification::topLeft, 2);
+    r.removeFromTop (8);
     g.setColour (Theme::buttonLine);
     g.fillRect (r.removeFromTop (1));
     r.removeFromTop (14);
@@ -509,13 +544,8 @@ void AnalysisPanel::resized()
     auto r = getLocalBounds().reduced (22, 18);
     if (! sibMode)
     {
-        r.removeFromTop (34);
-        threshold.setBounds (r.removeFromTop (52));
-        r.removeFromTop (25);
-        r.removeFromTop (34);
-        reduction.setBounds (r.removeFromTop (52));
-        r.removeFromTop (10);
-        reductionSlider.setBounds (r.removeFromTop (28));
+        r.removeFromTop (30 + 8);
+        blobSize.setBounds (r.removeFromTop (30));
         return;
     }
     r.removeFromTop (34);
@@ -553,12 +583,29 @@ GainEditorEditor::GainEditorEditor (GainEditorProcessor& p)
 {
     setWantsKeyboardFocus (true);
 
-    for (auto* b : { &playBtn, &stopBtn, &recordBtn, &syncBtn, &rangeBtn, &envBtn, &blobBtn, &peakBtn, &sibBtn,
-                     &undoBtn, &redoBtn, &resetBtn, &loudBtn, &showSibBtn })
+    for (auto* b : { &playBtn, &stopBtn, &recordBtn, &syncBtn, &rangeBtn, &envBtn, &blobBtn,
+                     &undoBtn, &redoBtn, &resetBtn, &loudBtn })
     {
         b->setWantsKeyboardFocus (false);
         addAndMakeVisible (b);
     }
+    // Peak and Sibilance are left out of this version
+    peakBtn.setVisible (false);
+    sibBtn.setVisible (false);
+    showSibBtn.setVisible (false);
+
+    // Blob size slider: changes only what the next click grabs
+    panel.blobSize.setValue ((double) proc.uiState.getProperty ("blobRes", 0.4f), juce::dontSendNotification);
+    panel.blobSizeName = Analysis::resolutionName ((float) panel.blobSize.getValue());
+    panel.blobSize.onValueChange = [this]
+    {
+        const auto v = (float) panel.blobSize.getValue();
+        proc.uiState.setProperty ("blobRes", v, nullptr);
+        panel.blobSizeName = Analysis::resolutionName (v);
+        panel.repaint();
+        view.repaint();
+        repaint (0, getHeight() - 40, getWidth(), 40);
+    };
 
     rangeBtn.setShortcutHint ("1");
     envBtn.setShortcutHint ("2");
@@ -638,7 +685,7 @@ GainEditorEditor::GainEditorEditor (GainEditorProcessor& p)
     syncBtn.setTooltip ("DAW: Play / Stop here start and stop Ableton from the same point. Right-click for setup.");
     rangeBtn.setTooltip ("Range [1]: drag to select, then drag up/down inside it");
     envBtn.setTooltip ("Envelope [2]: click to add points, drag them, double-click to delete");
-    blobBtn.setTooltip ("Blob [3]: hover and drag up/down. Zoom in for smaller blobs, out for bigger ones");
+    blobBtn.setTooltip ("Blob [3]: hover and drag up/down. Blob Size (right panel) sets how big the next blob is");
     peakBtn.setTooltip ("Peak [4]: drag a diamond down to lower that peak. Shift-click for several");
     undoBtn.setTooltip ("Undo  [Cmd+Z]");
     redoBtn.setTooltip ("Redo  [Shift+Cmd+Z]");
@@ -727,7 +774,7 @@ GainEditorEditor::GainEditorEditor (GainEditorProcessor& p)
 
     auto savedTool = (int) proc.uiState.getProperty ("tool", (int) Tool::blob);
     if (savedTool == (int) Tool::select) savedTool = (int) Tool::blob;
-    selectTool ((Tool) juce::jlimit (1, 5, savedTool));
+    selectTool ((Tool) juce::jlimit (1, 3, savedTool));
 
     peaks.update (proc.getCapture(), 0, proc.getCapture().getWrittenEnd());
     startTimerHz (30);
@@ -803,7 +850,7 @@ void GainEditorEditor::paint (juce::Graphics& g)
 
     g.setColour (Theme::buttonLine);
     g.fillRect (syncBtn.getRight() + 18, 18, 1, 30);
-    g.fillRect (sibBtn.getRight() + 12, 18, 1, 30);
+    g.fillRect (blobBtn.getRight() + 12, 18, 1, 30);
 
     // status bar
     auto status = getLocalBounds().removeFromBottom (40);
@@ -861,15 +908,15 @@ void GainEditorEditor::resized()
     placeRight (undoBtn, 24);
 
     // tools: spread evenly in what is left
-    ToolButton* tools[] = { &rangeBtn, &envBtn, &blobBtn, &peakBtn, &sibBtn };
+    ToolButton* tools[] = { &rangeBtn, &envBtn, &blobBtn };
     int total = 0;
     for (auto* t : tools) total += t->getIdealWidth();
-    const auto gap = juce::jlimit (6, 30, (bar.getWidth() - total) / 5);
+    const auto gap = juce::jlimit (6, 30, (bar.getWidth() - total) / 3);
     for (auto* t : tools) place (*t, gap);
 
     overview.setBounds (r.removeFromTop (88).reduced (0, 6));
     auto statusArea = r.removeFromBottom (40);
-    showSibBtn.setBounds (statusArea.withX (380).withWidth (showSibBtn.getIdealWidth()).reduced (0, 6));
+    juce::ignoreUnused (statusArea);
     if (panel.isVisible())
         panel.setBounds (r.removeFromRight (290));
     view.setBounds (r);
@@ -901,9 +948,9 @@ void GainEditorEditor::selectTool (Tool t)
 
 void GainEditorEditor::cycleTool (int direction)
 {
-    // Range, Envelope, Blob, Peak, Sibilance  (enum values 1..5)
-    const auto n = (int) view.getTool() - 1;
-    selectTool ((Tool) (1 + (n + direction + 5) % 5));
+    // Range, Envelope, Blob  (enum values 1..3)
+    const auto n = juce::jlimit (0, 2, (int) view.getTool() - 1);
+    selectTool ((Tool) (1 + (n + direction + 3) % 3));
 }
 
 void GainEditorEditor::showSyncHelp()
@@ -1080,8 +1127,7 @@ bool GainEditorEditor::keyPressed (const juce::KeyPress& key)
         case '1': selectTool (Tool::range); return true;
         case '2': selectTool (Tool::envelope); return true;
         case '3': selectTool (Tool::blob); return true;
-        case '4': selectTool (Tool::peak); return true;
-        case '5': selectTool (Tool::sibilance); return true;
+
         case 'l': setPanelVisible (! panel.isVisible()); return true;
         case '+': case '=': view.zoomBy (1.6); return true;
         case '-': case '_': view.zoomBy (1.0 / 1.6); return true;

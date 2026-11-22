@@ -54,7 +54,7 @@ private:
 };
 
 //==============================================================================
-/** Right-hand panel: Threshold, Reduction and Selection Analysis. */
+/** Right-hand panel: Blob Size and Selection Analysis. */
 class AnalysisPanel : public juce::Component
 {
 public:
@@ -69,6 +69,8 @@ public:
                      bool hasSelected = false; juce::String selStart; double selLength = 0.0; float selDb = 0.0f; };
     void setSibInfo (const SibInfo& i) { sibInfo = i; repaint(); }
 
+    juce::Slider blobSize;             // Phrase ... Peak
+    juce::String blobSizeName;
     StepperBox threshold { -40.0f, 0.0f, 0.5f };
     StepperBox reduction { -24.0f, 0.0f, 0.5f };
     juce::Slider reductionSlider;
@@ -101,6 +103,7 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
     bool keyPressed (const juce::KeyPress&) override;
+    AnalysisPanel& getPanelForTest() { return panel; }
 
 private:
     void timerCallback() override;
