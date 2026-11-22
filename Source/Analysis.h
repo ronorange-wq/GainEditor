@@ -17,6 +17,9 @@ namespace Analysis
     */
     std::vector<Segment> detectBlobs (const CaptureStore& audio, int64_t start, int64_t end, float resolution);
 
+    /** The blob length a slider position aims for, in ms (Phrase 1.2 s ... Peak 25 ms). */
+    double blobTargetMs (float resolution);
+
     /** Blob size follows zoom: the closer you zoom in, the smaller the blobs (down to single peaks). */
     float resolutionForZoom (double samplesPerPixel, double sampleRate);
 

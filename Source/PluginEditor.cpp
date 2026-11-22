@@ -569,6 +569,13 @@ void AnalysisPanel::resized()
 //==============================================================================
 // Editor
 //==============================================================================
+static juce::String blobSizeLabel (float r)
+{
+    const auto ms = Analysis::blobTargetMs (r);
+    const auto len = ms >= 1000.0 ? juce::String (ms / 1000.0, 1) + " s" : juce::String ((int) std::round (ms)) + " ms";
+    return Analysis::resolutionName (r) + "  ~" + len;
+}
+
 static juce::String timeText (int64_t samples, double sr)
 {
     const auto sec = juce::jmax (0.0, (double) samples / sr);
@@ -589,6 +596,34 @@ GainEditorEditor::GainEditorEditor (GainEditorProcessor& p)
         b->setWantsKeyboardFocus (false);
         addAndMakeVisible (b);
     }
+    // Zoom: buttons and a slider in the status bar
+    for (auto* b : { &zoomOutBtn, &zoomInBtn, &fitBtn })
+    {
+        b->setWantsKeyboardFocus (false);
+        addAndMakeVisible (b);
+    }
+    zoomOutBtn.setTooltip ("Zoom out (-)");
+    zoomInBtn.setTooltip ("Zoom in (+)");
+    fitBtn.setTooltip ("Show the whole recording");
+    zoomOutBtn.onClick = [this] { view.zoomBy (0.5); syncZoomSlider(); };
+    zoomInBtn.onClick  = [this] { view.zoomBy (2.0); syncZoomSlider(); };
+    fitBtn.onClick     = [this] { view.zoomToFit(); syncZoomSlider(); view.repaint(); };
+    zoomSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    zoomSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+    zoomSlider.setRange (0.0, 1.0, 0.0);
+    zoomSlider.setWantsKeyboardFocus (false);
+    zoomSlider.setColour (juce::Slider::trackColourId, Theme::wave);
+    zoomSlider.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff3a414c));
+    zoomSlider.setColour (juce::Slider::thumbColourId, juce::Colours::white);
+    zoomSlider.setTooltip ("Zoom");
+    zoomSlider.onValueChange = [this]
+    {
+        if (zoomSliderBusy) return;
+        view.setZoomAmount (zoomSlider.getValue());
+        view.repaint();
+    };
+    addAndMakeVisible (zoomSlider);
+
     // Peak and Sibilance are left out of this version
     peakBtn.setVisible (false);
     sibBtn.setVisible (false);
@@ -596,12 +631,12 @@ GainEditorEditor::GainEditorEditor (GainEditorProcessor& p)
 
     // Blob size slider: changes only what the next click grabs
     panel.blobSize.setValue ((double) proc.uiState.getProperty ("blobRes", 0.4f), juce::dontSendNotification);
-    panel.blobSizeName = Analysis::resolutionName ((float) panel.blobSize.getValue());
+    panel.blobSizeName = blobSizeLabel ((float) panel.blobSize.getValue());
     panel.blobSize.onValueChange = [this]
     {
         const auto v = (float) panel.blobSize.getValue();
         proc.uiState.setProperty ("blobRes", v, nullptr);
-        panel.blobSizeName = Analysis::resolutionName (v);
+        panel.blobSizeName = blobSizeLabel (v);
         panel.repaint();
         view.repaint();
         repaint (0, getHeight() - 40, getWidth(), 40);
@@ -870,11 +905,12 @@ void GainEditorEditor::paint (juce::Graphics& g)
     status.removeFromLeft (8);
     g.setFont (juce::FontOptions (16.0f));
     g.setColour (Theme::text);
-    g.drawText ("DAW sync:", status.removeFromLeft (84), juce::Justification::centredLeft);
+    g.drawText ("DAW:", status.removeFromLeft (44), juce::Justification::centredLeft);
     const bool on = proc.isAbletonSync();
-    g.setColour (on ? Theme::wave : Theme::textDim);
+    const bool connected = on && proc.isDawConnected();
+    g.setColour (connected ? Theme::wave : (on ? juce::Colour (0xffe0a040) : Theme::textDim));
     g.setFont (juce::FontOptions (16.0f, juce::Font::bold));
-    g.drawText (on ? "On" : "Off", status.removeFromLeft (40), juce::Justification::centredLeft);
+    g.drawText (connected ? "Connected" : (on ? "Not connected" : "Off"), status.removeFromLeft (124), juce::Justification::centredLeft);
     g.setColour (Theme::buttonLine);
     g.fillRect (status.removeFromLeft (20).withSizeKeepingCentre (1, 22));
     status.removeFromLeft (14);
@@ -915,8 +951,15 @@ void GainEditorEditor::resized()
     for (auto* t : tools) place (*t, gap);
 
     overview.setBounds (r.removeFromTop (88).reduced (0, 6));
-    auto statusArea = r.removeFromBottom (40);
-    juce::ignoreUnused (statusArea);
+    auto statusArea = r.removeFromBottom (40).reduced (20, 0);
+    {
+        auto z = statusArea.withTrimmedRight (130);
+        auto put = [&z] (juce::Component& c, int w) { c.setBounds (z.removeFromRight (w).withSizeKeepingCentre (w, 28)); z.removeFromRight (6); };
+        put (fitBtn, fitBtn.getIdealWidth());
+        put (zoomInBtn, 34);
+        put (zoomSlider, 220);
+        put (zoomOutBtn, 34);
+    }
     if (panel.isVisible())
         panel.setBounds (r.removeFromRight (290));
     view.setBounds (r);
@@ -964,9 +1007,10 @@ void GainEditorEditor::showSyncHelp()
                                        : "Could not install the control surface: " + where + "\n\n")
                       + "1. Restart Ableton Live.\n"
                         "2. Settings > Link, Tempo & MIDI > Control Surface: choose \"GainEditor\".\n"
-                        "   Input: \"Gain Editor\". Output: None.\n"
-                        "3. Done. Click anywhere on the waveform and press Space:\n"
-                        "   Ableton jumps to that point and plays every track together.")
+                        "   Input and Output: None (nothing else to pick).\n"
+                        "3. The status bar says \"DAW: Connected\". Now Play / Space starts Ableton\n"
+                        "   from the cursor and plays every track together.\n\n"
+                        "While it says \"Not connected\", Play only plays the recording inside the plugin.")
         .withButton ("OK")
         .withAssociatedComponent (this),
         nullptr);
@@ -978,7 +1022,7 @@ void GainEditorEditor::togglePlay()
     const bool target = view.getTargetRegion (a, b);
     const auto from = target ? a : view.getCursor();
 
-    if (proc.isAbletonSync())
+    if (proc.isAbletonSync() && proc.isDawConnected())
     {
         proc.stopAudition();
         if (proc.isHostPlaying()) proc.sendStop();
@@ -1048,6 +1092,18 @@ void GainEditorEditor::updateAnalysis()
 }
 
 //==============================================================================
+void GainEditorEditor::syncZoomSlider()
+{
+    if (zoomSlider.isMouseButtonDown())
+        return;
+    const auto v = view.getZoomAmount();
+    if (std::abs (v - zoomSlider.getValue()) > 1.0e-4)
+    {
+        const juce::ScopedValueSetter<bool> busy (zoomSliderBusy, true);
+        zoomSlider.setValue (v, juce::sendNotificationSync);
+    }
+}
+
 void GainEditorEditor::timerCallback()
 {
     auto& cap = proc.getCapture();
@@ -1072,6 +1128,16 @@ void GainEditorEditor::timerCallback()
     const bool moving = proc.isHostPlaying() || proc.isAuditioning();
     if (moving)
         view.followPlayhead (proc.getPlayPosition());
+    syncZoomSlider();
+    {
+        const int dawState = proc.isAbletonSync() ? (proc.isDawConnected() ? 2 : 1) : 0;
+        if (dawState != lastDawState)
+        {
+            lastDawState = dawState;
+            refreshButtons();
+            repaint (0, getHeight() - 40, getWidth(), 40);
+        }
+    }
 
     if (changedAudio || moving || proc.isCapturing())
     {

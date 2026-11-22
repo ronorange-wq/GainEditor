@@ -118,6 +118,7 @@ private:
     void applySibReduction();
     void updateSibInfo();
     void showSyncHelp();
+    void syncZoomSlider();
 
     GainEditorProcessor& proc;
     PeakCache peaks;
@@ -133,6 +134,12 @@ private:
     ToolButton envBtn { "Envelope", ToolButton::Icon::envelope };
     ToolButton blobBtn { "Blob", ToolButton::Icon::blob };
     ToolButton peakBtn { "Peak", ToolButton::Icon::peak };
+    ToolButton zoomOutBtn { {}, ToolButton::Icon::zoomOut, ToolButton::Accent::normal, true };
+    ToolButton zoomInBtn { {}, ToolButton::Icon::zoomIn, ToolButton::Accent::normal, true };
+    ToolButton fitBtn { "Fit", ToolButton::Icon::fit, ToolButton::Accent::normal, true };
+    juce::Slider zoomSlider;
+    bool zoomSliderBusy = false;
+    int lastDawState = -1;
     ToolButton sibBtn { "Sibilance", ToolButton::Icon::sibilance };
     ToolButton showSibBtn { "Show S in all tools", ToolButton::Icon::none, ToolButton::Accent::outline, true };
     ToolButton undoBtn { "Undo", ToolButton::Icon::undo, ToolButton::Accent::normal, true };

@@ -18,23 +18,7 @@ struct EditAction : public juce::UndoableAction
 
 //==============================================================================
 // One virtual MIDI port shared by every Gain Editor in the session.
-static std::shared_ptr<juce::MidiOutput> sharedMidiPort()
-{
-    static std::mutex m;
-    static std::weak_ptr<juce::MidiOutput> weak;
-    const std::lock_guard<std::mutex> lock (m);
-
-    if (auto existing = weak.lock())
-        return existing;
-
-   #if JUCE_MAC || JUCE_LINUX
-    std::shared_ptr<juce::MidiOutput> port (juce::MidiOutput::createNewDevice ("Gain Editor").release());
-    weak = port;
-    return port;
-   #else
-    return {};
-   #endif
-}
+static constexpr int dawPort = 47447;   // the GainEditor control surface listens here (127.0.0.1 only)
 
 //==============================================================================
 GainEditorProcessor::GainEditorProcessor()
@@ -324,14 +308,66 @@ void GainEditorProcessor::setReductionDb (float db)
 
 bool GainEditorProcessor::isAbletonSync() const
 {
-    return (bool) uiState.getProperty ("abletonSync", false);
+    return (bool) uiState.getProperty ("abletonSync", true);
+}
+
+bool GainEditorProcessor::isDawConnected() const noexcept
+{
+    const auto t = lastPongMs.load();
+    return t != 0 && juce::Time::getMillisecondCounter() - t < 2500;
+}
+
+void GainEditorProcessor::sendToDaw (const juce::String& text)
+{
+    if (link == nullptr)
+    {
+        link = std::make_unique<juce::DatagramSocket> (false);
+        if (! link->bindToPort (0, "127.0.0.1"))
+        {
+            link.reset();
+            return;
+        }
+    }
+    const auto utf8 = text.toStdString();
+    link->write ("127.0.0.1", dawPort, utf8.data(), (int) utf8.size());
+}
+
+void GainEditorProcessor::serviceLink()
+{
+    if (! isAbletonSync())
+        return;
+
+    if (! scriptChecked)
+    {
+        scriptChecked = true;   // keep the script in Ableton's User Library up to date
+        juce::String where;
+        installRemoteScript (where);
+    }
+
+    const auto now = juce::Time::getMillisecondCounter();
+    if (link == nullptr || now - lastPingMs > 1000)
+    {
+        lastPingMs = now;
+        sendToDaw ("GE PING");
+    }
+    if (link == nullptr)
+        return;
+
+    char buf[256];
+    while (link->waitUntilReady (true, 0) == 1)
+    {
+        const auto n = link->read (buf, (int) sizeof (buf) - 1, false);
+        if (n <= 0)
+            break;
+        buf[n] = 0;
+        if (juce::String (buf).startsWith ("GE PONG"))
+            lastPongMs = now;
+    }
 }
 
 void GainEditorProcessor::setAbletonSync (bool on)
 {
     uiState.setProperty ("abletonSync", on, nullptr);
-    if (on && midiOut == nullptr)
-        midiOut = sharedMidiPort();
     if (on)
     {
         juce::String where;
@@ -340,35 +376,26 @@ void GainEditorProcessor::setAbletonSync (bool on)
     sendChangeMessage();
 }
 
-void GainEditorProcessor::sendSysEx (const juce::uint8* data, int size)
-{
-    if (midiOut == nullptr)
-        midiOut = sharedMidiPort();
-    if (midiOut != nullptr)
-        midiOut->sendMessageNow (juce::MidiMessage::createSysExMessage (data, size));
-}
-
-// SysEx: F0 7D 47 45 <cmd> [5 x 7-bit beats*1000] F7   (7D = non-commercial id, "GE")
 void GainEditorProcessor::sendPlayFrom (int64_t pos)
 {
     const auto sr = capture.getSampleRate();
     const auto beats = juce::jmax (0.0, refPpq.load() + (double) (pos - refSamples.load()) / sr * refBpm.load() / 60.0);
-    auto v = (juce::uint64) std::llround (beats * 1000.0);
-    juce::uint8 msg[10] = { 0x7D, 0x47, 0x45, 0x01, 0, 0, 0, 0, 0 };
-    for (int i = 4; i >= 0; --i) { msg[4 + i] = (juce::uint8) (v & 0x7F); v >>= 7; }
-    sendSysEx (msg, 9);
+    sendToDaw ("GE PLAY " + juce::String (beats, 4));
 }
 
 void GainEditorProcessor::sendStop()
 {
-    const juce::uint8 msg[] = { 0x7D, 0x47, 0x45, 0x02 };
-    sendSysEx (msg, 4);
+    sendToDaw ("GE STOP");
 }
 
-static const char* remoteScriptSource = R"PY(# Gain Editor control surface for Ableton Live.
+static const char* remoteScriptSource = R"PY(# Gain Editor control surface for Ableton Live (v2).
 # Lets the Gain Editor plugin start Ableton from a position and stop it.
-# Installed automatically by the plugin. Select it in Settings > Link, Tempo & MIDI > Control Surface.
+# Installed automatically by the plugin. Select it in Settings > Link, Tempo & MIDI > Control Surface
+# (Input and Output can stay None). It only listens on this computer (127.0.0.1).
+import socket
 from _Framework.ControlSurface import ControlSurface
+
+PORT = 47447
 
 
 def create_instance(c_instance):
@@ -378,24 +405,55 @@ def create_instance(c_instance):
 class GainEditor(ControlSurface):
     def __init__(self, c_instance):
         ControlSurface.__init__(self, c_instance)
-        self.log_message("Gain Editor control surface ready")
+        self._sock = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", PORT))
+            s.setblocking(False)
+            self._sock = s
+            self.log_message("Gain Editor control surface ready on port %d" % PORT)
+        except Exception as e:
+            self.log_message("Gain Editor control surface could not open port: %s" % e)
 
-    def handle_sysex(self, midi_bytes):
-        if len(midi_bytes) < 6 or midi_bytes[1] != 0x7D or midi_bytes[2] != 0x47 or midi_bytes[3] != 0x45:
+    def update_display(self):
+        ControlSurface.update_display(self)
+        self._poll()
+
+    def _poll(self):
+        if self._sock is None:
             return
-        cmd = midi_bytes[4]
+        for _ in range(32):
+            try:
+                data, addr = self._sock.recvfrom(256)
+            except Exception:
+                return
+            try:
+                self._handle(data.decode("utf-8", "ignore").split(), addr)
+            except Exception as e:
+                self.log_message("Gain Editor: %s" % e)
+
+    def _handle(self, words, addr):
+        if len(words) < 2 or words[0] != "GE":
+            return
+        cmd = words[1]
         song = self.song()
-        if cmd == 1 and len(midi_bytes) >= 11:
-            value = 0
-            for b in midi_bytes[5:10]:
-                value = (value << 7) | (b & 0x7F)
-            song.current_song_time = value / 1000.0
+        if cmd == "PING":
+            self._sock.sendto(b"GE PONG", addr)
+        elif cmd == "PLAY" and len(words) >= 3:
+            song.current_song_time = max(0.0, float(words[2]))
             if not song.is_playing:
                 song.continue_playing()
-        elif cmd == 2:
+        elif cmd == "STOP":
             song.stop_playing()
 
     def disconnect(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
         ControlSurface.disconnect(self)
 )PY";
 
@@ -421,6 +479,8 @@ bool GainEditorProcessor::installRemoteScript (juce::String& result)
 //==============================================================================
 void GainEditorProcessor::timerCallback()
 {
+    serviceLink();
+
     // Keep memory ready ahead of the play position while capturing.
     if (capturing.load())
     {
@@ -524,8 +584,11 @@ void GainEditorProcessor::setStateInformation (const void* data, int sizeInBytes
         capture.setSampleRate (currentSampleRate);
     suspendProcessing (false);
 
-    if (isAbletonSync() && midiOut == nullptr)
-        midiOut = sharedMidiPort();
+    if (isAbletonSync())
+    {
+        juce::String where;
+        installRemoteScript (where);
+    }
 
     undoManager.clearUndoHistory();
     publishGainMap();

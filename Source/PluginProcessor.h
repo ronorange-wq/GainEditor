@@ -78,10 +78,11 @@ public:
     float getSibReductionDb() const { return (float) uiState.getProperty ("sibReductionDb", 0.0f); }
     void setSibReductionDb (float v) { uiState.setProperty ("sibReductionDb", juce::jlimit (-24.0f, 0.0f, v), nullptr); }
 
-    // ---- Ableton transport through a virtual MIDI port called "Gain Editor" ----
+    // ---- Ableton transport: a local connection (127.0.0.1) to the GainEditor control surface script ----
     bool isAbletonSync() const;
     void setAbletonSync (bool on);
-    bool hasMidiPort() const noexcept { return midiOut != nullptr; }
+    /** True while the GainEditor script inside Ableton answers (checked every second). */
+    bool isDawConnected() const noexcept;
     /** Asks Ableton (through the GainEditor control surface script) to play from a timeline position. */
     void sendPlayFrom (int64_t timelinePos);
     void sendStop();
@@ -113,8 +114,12 @@ private:
     double currentSampleRate = 48000.0;
 
     // The recording is stored inside the Ableton project (FLAC), encoded once per change.
-    std::shared_ptr<juce::MidiOutput> midiOut;
-    void sendSysEx (const juce::uint8* data, int size);
+    std::unique_ptr<juce::DatagramSocket> link;
+    juce::uint32 lastPingMs = 0;
+    bool scriptChecked = false;
+    std::atomic<juce::uint32> lastPongMs { 0 };
+    void sendToDaw (const juce::String& text);
+    void serviceLink();
 
     // last known link between samples and beats (from Ableton's play head)
     std::atomic<double> refPpq { 0.0 }, refBpm { 120.0 };

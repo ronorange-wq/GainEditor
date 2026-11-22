@@ -97,6 +97,9 @@ public:
     Tool getTool() const noexcept { return tool; }
     void zoomBy (double factor, double anchorX = -1.0);
     void zoomToFit();
+    /** Zoom as 0 (whole take) ... 1 (closest), for the zoom slider. */
+    double getZoomAmount() const;
+    void setZoomAmount (double amount);
     void zoomToSelection();
     void zoomVertical (float factor);
     void scrollTo (double startSample);

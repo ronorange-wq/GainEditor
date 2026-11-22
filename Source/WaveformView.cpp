@@ -248,6 +248,37 @@ void WaveformView::zoomBy (double factor, double anchorX)
     scrollTo (anchorPos - (anchorX - waveArea().getX()) * spp);
 }
 
+static constexpr double closestSpp = 0.5;
+
+double WaveformView::getZoomAmount() const
+{
+    const auto& c = proc.getCapture();
+    const auto w = waveArea().getWidth();
+    if (! c.hasData() || w <= 0)
+        return 0.0;
+    const auto fit = juce::jmax (closestSpp * 2.0, (double) (c.getWrittenEnd() - c.getWrittenStart()) / (w * 0.98));
+    return juce::jlimit (0.0, 1.0, std::log (fit / spp) / std::log (fit / closestSpp));
+}
+
+void WaveformView::setZoomAmount (double amount)
+{
+    const auto& c = proc.getCapture();
+    const auto w = waveArea().getWidth();
+    if (! c.hasData() || w <= 0)
+        return;
+    amount = juce::jlimit (0.0, 1.0, amount);
+    if (amount <= 0.0005) { zoomToFit(); changed(); return; }
+    const auto fit = juce::jmax (closestSpp * 2.0, (double) (c.getWrittenEnd() - c.getWrittenStart()) / (w * 0.98));
+    const auto target = fit * std::pow (closestSpp / fit, amount);
+    // keep the cursor (or the play position) in place if it is on screen, otherwise the centre
+    auto anchorX = (double) waveArea().getCentreX();
+    const auto cx = posToX ((double) cursor);
+    if (cx >= waveArea().getX() && cx <= waveArea().getRight())
+        anchorX = cx;
+    zoomBy (spp / target, anchorX);
+    changed();
+}
+
 void WaveformView::zoomToFit()
 {
     const auto& c = proc.getCapture();

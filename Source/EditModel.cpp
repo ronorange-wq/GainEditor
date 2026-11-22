@@ -131,28 +131,36 @@ float GainMap::gainAt (int64_t pos) const noexcept
 //==============================================================================
 namespace EditOps
 {
+    /** Fades are centred on the edges, so two edits that touch blend into each other
+        (no 0 dB bump between two neighbouring blobs). */
+    static int64_t halfFade (int64_t start, int64_t end, double sampleRate, float fadeSeconds)
+    {
+        const auto fade = juce::jmin ((double) fadeSeconds * sampleRate, (double) (end - start));
+        return (int64_t) (fade * 0.5);
+    }
+
+    static int64_t margin (double sampleRate) { return (int64_t) (sampleRate * rangeFadeSeconds * 0.5) + 1; }
+
     static float edgeWeight (int64_t pos, int64_t start, int64_t end, double sampleRate, float fadeSeconds = edgeFadeSeconds)
     {
-        if (pos < start || pos >= end)
+        const auto h = halfFade (start, end, sampleRate, fadeSeconds);
+        if (pos < start - h || pos >= end + h)
             return 0.0f;
+        if (h < 1)
+            return pos >= start && pos < end ? 1.0f : 0.0f;
 
-        const auto len = (double) (end - start);
-        const auto fade = juce::jmin ((double) fadeSeconds * sampleRate, len * 0.5);
-        if (fade < 1.0)
-            return 1.0f;
-
-        const auto d = juce::jmin ((double) (pos - start), (double) (end - 1 - pos));
-        if (d >= fade)
-            return 1.0f;
-
-        return (float) (0.5 - 0.5 * std::cos (d / fade * juce::MathConstants<double>::pi));
+        const auto fade = (double) (2 * h);
+        const auto rise = juce::jlimit (0.0, 1.0, (double) (pos - (start - h)) / fade);
+        const auto fall = juce::jlimit (0.0, 1.0, (double) ((end + h) - pos) / fade);
+        const auto x = juce::jmin (rise, fall);
+        return (float) (0.5 - 0.5 * std::cos (x * juce::MathConstants<double>::pi));
     }
 
     float rangeDbAt (const EditState& s, int64_t pos, double sr)
     {
         float db = 0.0f;
         for (auto& r : s.ranges)
-            if (pos >= r.start && pos < r.end)
+            if (pos >= r.start - margin (sr) && pos < r.end + margin (sr))
                 db += r.db * edgeWeight (pos, r.start, r.end, sr, rangeFadeSeconds);
         return db;
     }
@@ -181,9 +189,9 @@ namespace EditOps
         float db = 0.0f;
         for (auto& b : s.spots)
         {
-            if (b.start > pos) break;          // sorted by start
+            if (b.start - margin (sr) > pos) break;          // sorted by start
             if (s.sibFilter && SpotEdit::isSibilance (b.kind)) continue;   // goes to the highs only
-            if (pos < b.end)
+            if (pos < b.end + margin (sr))
                 db += b.db * edgeWeight (pos, b.start, b.end, sr);
         }
         return db;
@@ -194,8 +202,8 @@ namespace EditOps
         float db = 0.0f;
         for (auto& b : s.spots)
         {
-            if (b.start > pos) break;
-            if (SpotEdit::isSibilance (b.kind) && pos < b.end)
+            if (b.start - margin (sr) > pos) break;
+            if (SpotEdit::isSibilance (b.kind) && pos < b.end + margin (sr))
                 db += b.db * edgeWeight (pos, b.start, b.end, sr);
         }
         return db;
@@ -216,7 +224,7 @@ namespace EditOps
         auto map = std::make_shared<GainMap>();
 
         int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
-        auto extend = [&] (int64_t a, int64_t b) { lo = juce::jmin (lo, a); hi = juce::jmax (hi, b); };
+        auto extend = [&] (int64_t a, int64_t b) { lo = juce::jmin (lo, a - margin (sr)); hi = juce::jmax (hi, b + margin (sr)); };
 
         for (auto& r : s.ranges)   if (std::abs (r.db) > 0.0f) extend (r.start, r.end);
         for (auto& b : s.spots)    if (std::abs (b.db) > 0.0f && ! (s.sibFilter && SpotEdit::isSibilance (b.kind))) extend (b.start, b.end);
@@ -244,8 +252,9 @@ namespace EditOps
         auto addRegion = [&] (int64_t a, int64_t b, float value, float fade)
         {
             if (std::abs (value) <= 0.0f) return;
-            const auto i0 = (size_t) juce::jmax ((int64_t) 0, (a - lo) / GainMap::hop);
-            const auto i1 = (size_t) juce::jmin ((int64_t) n - 1, (b - lo) / GainMap::hop + 1);
+            const auto m = margin (sr);
+            const auto i0 = (size_t) juce::jmax ((int64_t) 0, (a - m - lo) / GainMap::hop);
+            const auto i1 = (size_t) juce::jmin ((int64_t) n - 1, (b + m - lo) / GainMap::hop + 1);
             for (auto i = i0; i <= i1; ++i)
                 db[i] += value * edgeWeight (lo + (int64_t) i * GainMap::hop, a, b, sr, fade);
         };
@@ -269,7 +278,7 @@ namespace EditOps
 
         int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
         for (auto& b : s.spots)
-            if (SpotEdit::isSibilance (b.kind) && std::abs (b.db) > 0.0f) { lo = juce::jmin (lo, b.start); hi = juce::jmax (hi, b.end); }
+            if (SpotEdit::isSibilance (b.kind) && std::abs (b.db) > 0.0f) { lo = juce::jmin (lo, b.start - margin (sr)); hi = juce::jmax (hi, b.end + margin (sr)); }
         if (hi <= lo)
             return map;
 
@@ -281,8 +290,8 @@ namespace EditOps
         for (auto& b : s.spots)
         {
             if (! SpotEdit::isSibilance (b.kind)) continue;
-            const auto i0 = (size_t) juce::jmax ((int64_t) 0, (b.start - lo) / GainMap::hop);
-            const auto i1 = (size_t) juce::jmin ((int64_t) n - 1, (b.end - lo) / GainMap::hop + 1);
+            const auto i0 = (size_t) juce::jmax ((int64_t) 0, (b.start - margin (sr) - lo) / GainMap::hop);
+            const auto i1 = (size_t) juce::jmin ((int64_t) n - 1, (b.end + margin (sr) - lo) / GainMap::hop + 1);
             for (auto i = i0; i <= i1; ++i)
                 db[i] += b.db * edgeWeight (lo + (int64_t) i * GainMap::hop, b.start, b.end, sr);
         }

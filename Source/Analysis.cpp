@@ -21,6 +21,11 @@ namespace Analysis
         return "Peak";
     }
 
+    double blobTargetMs (float resolution)
+    {
+        return lerpLog (1200.0, 25.0, (double) juce::jlimit (0.0f, 1.0f, resolution));
+    }
+
     std::vector<Segment> detectBlobs (const CaptureStore& audio, int64_t start, int64_t end, float resolution)
     {
         std::vector<Segment> result;
@@ -28,115 +33,143 @@ namespace Analysis
             return result;
 
         const auto sr = audio.getSampleRate();
-        const auto r = (double) juce::jlimit (0.0f, 1.0f, resolution);
 
-        // 1) Peak envelope with a 1 ms hop, on a fixed grid so the same audio always gives the same blobs.
+        // 1) Energy on a fixed 1 ms grid, so the same audio always gives the same blobs.
         const int hop = juce::jmax (1, (int) std::round (sr / 1000.0));
         start -= ((start % hop) + hop) % hop;
-        const auto numHops = (size_t) ((end - start + hop - 1) / hop);
-        std::vector<float> env (numHops, 0.0f);
+        const auto numHops = (int) ((end - start + hop - 1) / hop);
+        std::vector<double> energy ((size_t) numHops, 0.0);
         {
             std::vector<float> buf ((size_t) hop);
-            for (size_t i = 0; i < numHops; ++i)
+            for (int i = 0; i < numHops; ++i)
             {
                 const auto p = start + (int64_t) i * hop;
                 const auto n = (int) juce::jmin ((int64_t) hop, end - p);
                 audio.read (p, buf.data(), n);
-                float m = 0.0f;
+                double acc = 0.0;
                 for (int k = 0; k < n; ++k)
-                    m = juce::jmax (m, std::abs (buf[(size_t) k]));
-                env[i] = m;
+                    acc += (double) buf[(size_t) k] * buf[(size_t) k];
+                energy[(size_t) i] = acc / juce::jmax (1, n);
             }
         }
 
-        // 2) Smooth it. Phrase = 400 ms window ... Peak = no smoothing.
-        const auto windowHops = (int) std::round (lerpLog (400.0, 1.0, r));
-        std::vector<float> smooth (numHops, 0.0f);
-        if (windowHops <= 1)
+        // 2) Every slider position has one target length. Blobs are cut so they come out close to it.
+        const auto T = blobTargetMs (resolution);                      // in hops (1 hop = 1 ms)
+        const int window = juce::jlimit (1, 120, (int) std::round (T / 5.0));
+        std::vector<float> db ((size_t) numHops, -120.0f);
         {
-            smooth = env;
-        }
-        else
-        {
-            double acc = 0.0;
-            const int half = windowHops / 2;
-            std::vector<double> prefix (numHops + 1, 0.0);
-            for (size_t i = 0; i < numHops; ++i)
-                prefix[i + 1] = prefix[i] + env[i];
-            for (size_t i = 0; i < numHops; ++i)
+            std::vector<double> prefix ((size_t) numHops + 1, 0.0);
+            for (int i = 0; i < numHops; ++i)
+                prefix[(size_t) i + 1] = prefix[(size_t) i] + energy[(size_t) i];
+            const int half = window / 2;
+            for (int i = 0; i < numHops; ++i)
             {
-                const auto a = (size_t) juce::jmax (0, (int) i - half);
-                const auto b = (size_t) juce::jmin ((int) numHops, (int) i + half + 1);
-                acc = (prefix[b] - prefix[a]) / (double) (b - a);
-                smooth[i] = (float) acc;
+                const int a = juce::jmax (0, i - half), b = juce::jmin (numHops, i + half + 1);
+                const auto ms = (prefix[(size_t) b] - prefix[(size_t) a]) / (double) (b - a);
+                db[(size_t) i] = (float) (10.0 * std::log10 (ms + 1.0e-12));
             }
         }
 
-        auto toDb = [] (float v) { return juce::Decibels::gainToDecibels (v, -120.0f); };
+        float peakDb = -120.0f;
+        for (auto v : db) peakDb = juce::jmax (peakDb, v);
+        const auto gate = juce::jmax (-60.0f, peakDb - 40.0f);
 
-        // 3) Settings that follow the resolution.
-        const auto silenceDb = -50.0f;
-        const auto valleyDepthDb = (float) (9.0 + (0.4 - 9.0) * r);       // how deep a dip must be to split
-        const auto minLenHops = juce::jmax (1, (int) std::round (lerpLog (250.0, 1.5, r)));
-
-        // 4) Walk the envelope: silent hops end a blob, deep enough valleys split one.
-        std::vector<std::pair<size_t, size_t>> segs; // [a, b) in hops
-        size_t i = 0;
-        while (i < numHops)
+        // 3) Sound runs: above the gate, short gaps inside a run are closed.
+        std::vector<std::pair<int, int>> runs;
         {
-            while (i < numHops && toDb (smooth[i]) < silenceDb) ++i;
-            if (i >= numHops) break;
-            size_t runStart = i;
-            while (i < numHops && toDb (smooth[i]) >= silenceDb) ++i;
-            size_t runEnd = i;
-
-            // split this non-silent run at valleys
-            size_t segStart = runStart;
-            float segMax = smooth[runStart];
-            for (size_t k = runStart + 1; k + 1 < runEnd; ++k)
+            const int closeGap = juce::jlimit (3, 150, (int) std::round (T * 0.25));
+            int i = 0;
+            while (i < numHops)
             {
-                segMax = juce::jmax (segMax, smooth[k]);
-                const bool isMin = smooth[k] <= smooth[k - 1] && smooth[k] < smooth[k + 1];
-                if (! isMin)
-                    continue;
+                while (i < numHops && db[(size_t) i] < gate) ++i;
+                if (i >= numHops) break;
+                const int a = i;
+                while (i < numHops && db[(size_t) i] >= gate) ++i;
+                if (! runs.empty() && a - runs.back().second <= closeGap)
+                    runs.back().second = i;
+                else
+                    runs.push_back ({ a, i });
+            }
+        }
 
-                // highest point between this valley and the next valley
-                float nextMax = smooth[k];
-                for (size_t j = k + 1; j < runEnd; ++j)
+        // 4) Cut each run at its valleys, choosing the cuts that give blobs closest to the target length.
+        const int minLen = juce::jmax (2, (int) std::round (T * 0.35));
+        const int maxLen = juce::jmax (minLen + 1, (int) std::round (T * 4.0));
+        const int look = juce::jmax (2, (int) std::round (T * 0.5));
+
+        auto valleyDepth = [&] (int c, int lo, int hi)
+        {
+            float l = db[(size_t) c], r = db[(size_t) c];
+            for (int k = juce::jmax (lo, c - look); k < c; ++k) l = juce::jmax (l, db[(size_t) k]);
+            for (int k = c + 1; k < juce::jmin (hi, c + look + 1); ++k) r = juce::jmax (r, db[(size_t) k]);
+            return juce::jmin (l, r) - db[(size_t) c];
+        };
+
+        std::vector<std::pair<int, int>> segs;
+        for (auto [a, b] : runs)
+        {
+            if (b - a < 2)
+                continue;
+            if (b - a <= (int) (T * 1.6) || b - a < 2 * minLen)
+            {
+                segs.push_back ({ a, b });
+                continue;
+            }
+
+            std::vector<int> node { a };
+            std::vector<float> cutCost { 0.0f };
+            for (int k = a + minLen; k <= b - minLen; ++k)
+            {
+                const auto v = db[(size_t) k];
+                if (v <= db[(size_t) k - 1] && v < db[(size_t) k + 1])
                 {
-                    nextMax = juce::jmax (nextMax, smooth[j]);
-                    if (j + 1 < runEnd && smooth[j] <= smooth[j - 1] && smooth[j] < smooth[j + 1] && j > k + 1)
-                        break;
+                    node.push_back (k);
+                    cutCost.push_back (1.5f * std::exp (-valleyDepth (k, a, b) / 6.0f));
+                }
+            }
+            node.push_back (b);
+            cutCost.push_back (0.0f);
+
+            const auto m = node.size();
+            std::vector<double> best (m, 1.0e30);
+            std::vector<int> from (m, -1);
+            best[0] = 0.0;
+            for (size_t j = 1; j < m; ++j)
+                for (size_t i = j; i-- > 0;)
+                {
+                    const auto len = node[j] - node[i];
+                    if (len > maxLen && i + 1 < j) break;
+                    if (len < minLen && i > 0 && j + 1 < m) continue;
+                    const auto lc = std::log ((double) len / T);
+                    const auto c = best[i] + 3.0 * lc * lc + cutCost[j];
+                    if (c < best[j]) { best[j] = c; from[j] = (int) i; }
                 }
 
-                const auto depth = toDb (juce::jmin (segMax, nextMax)) - toDb (smooth[k]);
-                if (depth >= valleyDepthDb
-                    && (int) (k - segStart) >= minLenHops
-                    && (int) (runEnd - k) >= minLenHops)
-                {
-                    segs.push_back ({ segStart, k });
-                    segStart = k;
-                    segMax = smooth[k];
-                }
-            }
-            segs.push_back ({ segStart, runEnd });
+            std::vector<int> cuts;
+            for (int j = (int) m - 1; j > 0 && from[(size_t) j] >= 0; j = from[(size_t) j])
+                cuts.push_back (node[(size_t) j]);
+            cuts.push_back (a);
+            std::reverse (cuts.begin(), cuts.end());
+            for (size_t k = 0; k + 1 < cuts.size(); ++k)
+                segs.push_back ({ cuts[k], cuts[k + 1] });
         }
 
-        // 5) Merge pieces that are too short into a neighbour.
-        std::vector<std::pair<size_t, size_t>> merged;
-        for (auto& s : segs)
+        // 5) Give the outer edges of each run a little air, so attacks and tails are inside the blob.
+        const int pad = juce::jlimit (1, 12, (int) std::round (T * 0.1));
+        for (size_t k = 0; k < segs.size(); ++k)
         {
-            if (! merged.empty() && (int) (s.second - s.first) < minLenHops && merged.back().second == s.first)
-                merged.back().second = s.second;
-            else
-                merged.push_back (s);
+            auto& sgm = segs[k];
+            const int prevEnd = k > 0 ? segs[k - 1].second : 0;
+            const int nextStart = k + 1 < segs.size() ? segs[k + 1].first : numHops;
+            if (sgm.first > prevEnd)  sgm.first  = juce::jmax (prevEnd, sgm.first - pad);
+            if (sgm.second < nextStart) sgm.second = juce::jmin (nextStart, sgm.second + pad);
         }
 
-        for (auto& s : merged)
+        for (auto& sgm : segs)
         {
             Segment b;
-            b.start = start + (int64_t) s.first * hop;
-            b.end = juce::jmin (end, start + (int64_t) s.second * hop);
+            b.start = start + (int64_t) sgm.first * hop;
+            b.end = juce::jmin (end, start + (int64_t) sgm.second * hop);
             if (b.end > b.start)
                 result.push_back (b);
         }
